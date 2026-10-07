@@ -1,0 +1,10 @@
+.logoMark {
+  display: inline-flex;
+  align-items: center;
+}
+
+.logoImg {
+  display: block;
+  width: auto;
+  height: auto;
+}

@@ -1,0 +1,107 @@
+/* ============================================================================
+   HomeButton — shared across every page that has a header.
+
+   Uses the homepage tokens (globals.css) so it looks identical on the landing
+   page, the auth pages, /profile/create and inside the dashboard, all of which
+   sit on a dark surface.
+
+   Layout contract: a plain inline-flex flex child. No position: absolute/fixed,
+   no top/left/right/bottom values, no transform offsets. It therefore reflows
+   automatically with whatever header it is dropped into, on any viewport.
+   ============================================================================ */
+
+.btn {
+  /* `flex: 0 0 auto` keeps it from being squeezed out by siblings that grow
+     (like a search field) — it shrinks the *other* content instead. */
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.03);
+
+  color: var(--text, #e7e5dc);
+  font-family: var(--sans, "Inter", system-ui, sans-serif);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  text-decoration: none;
+
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.btn:hover {
+  border-color: var(--orange, #e87a26);
+  background: rgba(232, 122, 38, 0.1);
+  color: var(--orange-bright, #f2932c);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--orange, #e87a26);
+  outline-offset: 2px;
+}
+
+/* Slightly stronger fill for headers that already have a translucent backdrop. */
+.solid {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.icon {
+  display: block;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+}
+
+.label {
+  /* The word "Home" is always rendered — it is the accessible name too. */
+  display: inline-block;
+}
+
+/* ---------------------------------------------------------------------------
+   Viewport-driven adaptation. These are the only size rules; there is no
+   per-device branch anywhere in the code.
+   --------------------------------------------------------------------------- */
+
+/* Narrow phones: tighten the chrome, keep the label. */
+@media (max-width: 560px) {
+  .btn {
+    gap: 6px;
+    padding: 8px 12px;
+    font-size: 12.5px;
+  }
+}
+
+/* Very narrow (small phones in portrait, split-screen): drop to the icon plus
+   the label at minimum padding, and let the icon go rather than clip the text. */
+@media (max-width: 380px) {
+  .btn {
+    padding: 8px 11px;
+  }
+
+  .icon {
+    display: none;
+  }
+}
+
+/* Coarse pointers get a larger touch target (this tracks the input device, not
+   a specific handset model). */
+@media (hover: none) and (pointer: coarse) {
+  .btn {
+    min-height: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn {
+    transition-duration: 0.001ms !important;
+  }
+}

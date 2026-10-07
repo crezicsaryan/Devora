@@ -1,0 +1,317 @@
+/* ============ Devora auth pages (login / signup) ============ */
+
+.authPage {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  position: relative;
+  overflow: hidden;
+  background: #050505;
+  color: var(--text);
+  font-family: var(--sans);
+}
+
+/* Header row holding the Home button. A plain flex container — the button is
+   placed by the layout engine, not by fixed coordinates, so it reflows on any
+   viewport instead of sitting at a hardcoded offset. */
+.authNav {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 18px 20px 4px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Everything below the header centres in the space that is left. */
+.authBody {
+  flex: 1 1 auto;
+  display: grid;
+  place-items: center;
+  padding: 20px 20px 48px;
+}
+
+.authGlow {
+  position: absolute;
+  width: 620px;
+  height: 620px;
+  border-radius: 50%;
+  filter: blur(130px);
+  pointer-events: none;
+}
+
+.glowTop {
+  top: -240px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: radial-gradient(circle, rgba(232, 122, 38, 0.16), transparent 65%);
+}
+
+.glowBottom {
+  bottom: -280px;
+  right: -160px;
+  background: radial-gradient(circle, rgba(232, 122, 38, 0.08), transparent 65%);
+}
+
+.authCard {
+  position: relative;
+  width: 100%;
+  max-width: 420px;
+  background: linear-gradient(170deg, #111111, #0a0a0a);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 22px;
+  padding: 38px 34px 30px;
+  box-shadow:
+    0 0 0 1px rgba(232, 122, 38, 0.08),
+    0 34px 90px -28px rgba(0, 0, 0, 0.95),
+    0 0 70px -30px rgba(232, 122, 38, 0.45);
+}
+
+.brandRow {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 26px;
+}
+
+.brandImg {
+  display: block;
+  width: auto;
+  height: 40px;
+}
+
+h1.title {
+  font-family: var(--display);
+  font-size: 24px;
+  font-weight: 800;
+  color: #fff;
+  text-align: center;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+  margin-top: 8px;
+  line-height: 1.6;
+}
+
+.subtitle a {
+  color: var(--orange-bright);
+  font-weight: 600;
+}
+.subtitle a:hover { text-decoration: underline; }
+
+/* ---- form ---- */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  margin-top: 26px;
+}
+
+.field label {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+  margin-bottom: 7px;
+}
+
+.field input {
+  width: 100%;
+  background: #0d0d0d;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  padding: 12px 14px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-family: var(--sans);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.field input:focus {
+  border-color: rgba(232, 122, 38, 0.65);
+  box-shadow: 0 0 0 3px rgba(232, 122, 38, 0.14);
+}
+
+.field input::placeholder { color: var(--text-faint); }
+
+.errorBox {
+  background: rgba(217, 100, 90, 0.1);
+  border: 1px solid rgba(217, 100, 90, 0.4);
+  color: #eda9a1;
+  border-radius: 11px;
+  padding: 10px 13px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.okBox {
+  background: rgba(95, 174, 122, 0.1);
+  border: 1px solid rgba(95, 174, 122, 0.4);
+  color: #9fd4af;
+  border-radius: 11px;
+  padding: 10px 13px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.submitBtn {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 14px 26px;
+  border: none;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #f2932c, #e87a26);
+  color: #0b0b0c;
+  font-weight: 700;
+  font-size: 14px;
+  font-family: var(--sans);
+  cursor: pointer;
+  box-shadow: 0 8px 28px rgba(232, 122, 38, 0.4);
+  transition: filter 0.2s, transform 0.2s;
+}
+
+.submitBtn:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.submitBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---- Google-only sign-in ---- */
+.googleBtn {
+  margin-top: 26px;
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 26px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: #ffffff;
+  color: #1f1f1f;
+  font-weight: 700;
+  font-size: 14px;
+  font-family: var(--sans);
+  cursor: pointer;
+  transition: filter 0.2s, transform 0.2s;
+}
+
+.googleBtn:hover:not(:disabled) {
+  filter: brightness(0.96);
+  transform: translateY(-1px);
+}
+
+.googleBtn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* ---- divider ---- */
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 22px 0 16px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  letter-spacing: 1.6px;
+  font-family: var(--mono);
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* ---- OAuth ---- */
+.oauthRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.oauthBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 11px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--sans);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, transform 0.2s;
+}
+
+.oauthBtn:hover:not(:disabled) {
+  border-color: rgba(232, 122, 38, 0.5);
+  background: rgba(232, 122, 38, 0.07);
+  transform: translateY(-1px);
+}
+
+.oauthBtn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.footNote {
+  margin-top: 22px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.footNote a {
+  color: var(--text-dim);
+}
+.footNote a {
+  color: var(--orange-bright);
+  font-weight: 600;
+}
+.footNote a:hover { text-decoration: underline; }
+
+.legalNote {
+  margin-top: 30px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.legalNote a { color: var(--text-dim); }
+.legalNote a:hover { color: var(--orange-bright); }
+
+/* Retired: the old absolutely-positioned back link is replaced by the shared
+   HomeButton inside .authNav, which adapts to the viewport instead of sitting
+   at a fixed top/left offset. */
+.backHome {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  transition: color 0.15s;
+}
+.backHome:hover { color: var(--orange-bright); }
+
+@media (max-width: 480px) {
+  .authCard { padding: 30px 22px 24px; }
+  .oauthRow { grid-template-columns: 1fr; }
+  .authNav { padding: 14px 16px 2px; }
+}
