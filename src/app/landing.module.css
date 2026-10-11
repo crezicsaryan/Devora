@@ -203,6 +203,17 @@
   gap: 12px;
 }
 
+/* Signed-in greeting beside the nav CTA. */
+.greeting {
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text);
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .btnGhost {
   padding: 10px 22px;
   border-radius: 999px;
@@ -1853,6 +1864,7 @@
 }
 
 @media (max-width: 640px) {
+  .greeting { display: none; }
   .stripRow { justify-content: center; }
   .repoGrid { grid-template-columns: 1fr; }
   .miniStats { grid-template-columns: 1fr; }

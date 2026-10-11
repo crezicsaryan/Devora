@@ -11,6 +11,7 @@ import {
   computeProfileCompletion,
   getConnectedPlatforms,
   markAccountDisconnected,
+  updateProfile,
 } from "@/lib/db/repository";
 import { errorResponse, okResponse, requireProfileUser } from "@/lib/server-auth";
 import type { RouteParams } from "@/lib/route-params";
@@ -25,6 +26,25 @@ export async function DELETE(
   try {
     const user = await requireProfileUser();
     const { platform } = await ctx.params;
+
+    // LinkedIn and the personal website are plain profile links — clearing the
+    // field is the whole operation, and there is no account row to remove.
+    if (platform === "linkedin" || platform === "portfolio") {
+      await updateProfile(
+        user.id,
+        platform === "linkedin"
+          ? { socials: { linkedin: "" } }
+          : { socials: { portfolio: "" } }
+      );
+      const completion = await computeProfileCompletion(user.id);
+      return okResponse({
+        ok: true,
+        platform,
+        connectionStatus: "disconnected",
+        platforms: [],
+        completion,
+      });
+    }
 
     if (!PLATFORM_KEYS.includes(platform as PlatformKey)) {
       return errorResponse(new Error("Unknown platform."), "Unknown platform.");

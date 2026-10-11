@@ -13,7 +13,8 @@
 
 import { randomBytes } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
-import { query } from "@/lib/db/pool";
+import { prisma } from "@/lib/db/prisma";
+import { safeNextPath } from "@/lib/safe-path";
 import { errorResponse, requireUser } from "@/lib/server-auth";
 import {
   buildAuthorizeUrl,
@@ -26,28 +27,45 @@ export async function GET(request: NextRequest) {
   try {
     const user = await requireUser();
 
+    // Validated before anything else, so the not-configured path can send the
+    // user back to the page they started from instead of a hardcoded one.
+    const next = safeNextPath(
+      request.nextUrl.searchParams.get("next"),
+      "/profile/create"
+    );
+
     if (!githubOAuthConfigured()) {
-      return NextResponse.redirect(
-        new URL(
-          "/profile/create?platform_error=github_not_configured",
-          request.nextUrl.origin
-        )
+      const callback = new URL(
+        "/api/platforms/github/callback",
+        request.nextUrl.origin
+      ).toString();
+      const url = new URL(next, request.nextUrl.origin);
+      url.searchParams.set("platform_error", "github_not_configured");
+      // Names the exact missing variables and the exact callback URL, so the
+      // required configuration is never a guess.
+      url.searchParams.set(
+        "platform_message",
+        `GitHub OAuth is not configured: GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are missing. Callback URL: ${callback}`
       );
+      return NextResponse.redirect(url);
     }
 
     const state = randomBytes(32).toString("hex");
-    const next = request.nextUrl.searchParams.get("next") ?? "/profile/create";
 
-    await query(
-      `insert into public.oauth_states (state, user_id, provider, next, expires_at)
-       values ($1, $2, 'github', $3, now() + interval '10 minutes')`,
-      [state, user.id, next.startsWith("/") ? next : "/profile/create"]
-    );
+    await prisma.oauthState.create({
+      data: {
+        state,
+        user_id: user.id,
+        provider: "github",
+        next,
+        expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      },
+    });
 
     // Opportunistic cleanup of expired handshakes.
-    await query(`delete from public.oauth_states where expires_at < now()`).catch(
-      () => undefined
-    );
+    await prisma.oauthState
+      .deleteMany({ where: { expires_at: { lt: new Date() } } })
+      .catch(() => undefined);
 
     const redirectUri = new URL("/api/platforms/github/callback", request.nextUrl.origin)
       .toString();

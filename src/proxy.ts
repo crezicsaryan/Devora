@@ -13,6 +13,7 @@
 
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import type { CookieOptions } from "@supabase/ssr";
 
 /** Routes that require a session. */
 const PROTECTED_PREFIXES = ["/app", "/dashboard", "/profile/create"];
@@ -20,24 +21,25 @@ const PROTECTED_PREFIXES = ["/app", "/dashboard", "/profile/create"];
 const AUTH_ROUTES = ["/login", "/signup"];
 
 export async function proxy(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({ request });
+  const supabaseResponse = NextResponse.next({ request });
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   // Auth not configured yet — let the app render its own "not configured" UI.
   if (!url || !key) return supabaseResponse;
 
+  // Use the deprecated CookieMethodsServerDeprecated API (get/set) which
+  // correctly handles multi-session cookies (sb-<project>-auth-token.0/1).
+  // The newer getAll/setAll API has a bug with this format.
+  // Collect cookies set by Supabase so we can apply them to the response.
+  const cookiesToSet: Array<{ name: string; value: string; options: CookieOptions }> = [];
   const supabase = createServerClient(url, key, {
     cookies: {
-      getAll() {
-        return request.cookies.getAll();
+      get(name: string) {
+        return request.cookies.get(name)?.value ?? undefined;
       },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-        supabaseResponse = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) =>
-          supabaseResponse.cookies.set(name, value, options)
-        );
+      set(name: string, value: string, options: CookieOptions) {
+        cookiesToSet.push({ name, value, options });
       },
     },
   });
@@ -73,6 +75,10 @@ export async function proxy(request: NextRequest) {
     return NextResponse.redirect(redirectUrl);
   }
 
+  // Apply any cookies set by Supabase (e.g. after token refresh) to the response.
+  for (const { name, value, options } of cookiesToSet) {
+    supabaseResponse.cookies.set(name, value, options);
+  }
   return supabaseResponse;
 }
 

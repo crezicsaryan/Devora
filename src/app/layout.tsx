@@ -23,7 +23,7 @@ export const metadata: Metadata = {
     "Devora unifies your coding profiles into one shareable identity. Track, build, grow.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html
       lang="en"

@@ -357,12 +357,49 @@ export const projectSchema = z.object({
   imageUrl: z.string().optional(),
 });
 
+/**
+ * Legacy handle-only connect payload. Kept so existing callers keep working;
+ * new code should use `platformLinkSchema`, which also accepts a profile URL.
+ */
 export const platformConnectSchema = z.object({
   platform: z.enum(PLATFORM_KEYS),
   username: z
     .string()
     .transform((v) => sanitizeText(v, 60))
     .refine((v) => v.length >= 1, "Username is required."),
+});
+
+/**
+ * Everything a user can save a link for: the six coding platforms plus the two
+ * link-only profile fields. LinkedIn and portfolio live on the profile row, and
+ * are never presented as synchronized integrations.
+ */
+export const LINK_TARGET_KEYS = [
+  ...PLATFORM_KEYS,
+  "linkedin",
+  "portfolio",
+] as const;
+
+export type LinkTargetKey = (typeof LINK_TARGET_KEYS)[number];
+
+/**
+ * One platform connect / link payload.
+ *
+ * `input` is a handle OR a profile URL. It is deliberately NOT run through
+ * `sanitizeText`: that would trim a too-long value into a valid-looking one and
+ * hand the user a different handle than they typed. Length is validated here
+ * and the URL/handle parsing happens in `resolvePlatformInput`.
+ */
+export const platformLinkSchema = z.object({
+  platform: z.enum(LINK_TARGET_KEYS),
+  input: z
+    .string()
+    .transform((v) => v.trim())
+    .refine((v) => v.length >= 1, "Enter your username or your profile URL.")
+    .refine(
+      (v) => v.length <= 200,
+      "That is longer than a username or profile URL should be."
+    ),
 });
 
 /** Turn a Zod error into a single human-readable, user-safe message. */

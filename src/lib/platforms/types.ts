@@ -16,6 +16,7 @@
 
 import type { PlatformKey } from "@/lib/validation";
 import type { NormalizedStats } from "@/lib/db/repository";
+import type { PlatformVerifyResult } from "@/lib/types";
 
 export type SyncFailureReason =
   | "not_found"
@@ -24,7 +25,8 @@ export type SyncFailureReason =
   | "upstream_error"
   | "network"
   | "unsupported"
-  | "auth_required";
+  | "auth_required"
+  | "configuration_error";
 
 export class PlatformError extends Error {
   readonly reason: SyncFailureReason;
@@ -100,11 +102,14 @@ export interface PlatformAdapter {
   connect(ctx: ConnectContext): Promise<AdapterIdentity | null>;
 
   /**
-   * Cheap existence check for a public handle. Used by the onboarding UI to
-   * confirm a username is real before the user moves on. Never throws for a
-   * missing account — returns `{ exists: false }`.
+   * Cheap existence check for a public handle.
+   *
+   * MUST return a classified outcome rather than a boolean: "this account does
+   * not exist" and "we could not check right now" are different answers, and
+   * the UI shows a different message for each. Never throws for a missing
+   * account, and never reports exists:false for a server-side failure.
    */
-  verify(username: string): Promise<{ exists: boolean; message?: string }>;
+  verify(username: string): Promise<PlatformVerifyResult>;
 
   /** Profile-level identity + headline numbers. */
   fetchProfile(username: string, ctx?: SyncContext): Promise<AdapterIdentity | null>;
@@ -212,6 +217,18 @@ export async function platformFetch<T>(
     );
   }
   if (response.status === 401 || response.status === 403) {
+    // GitHub answers an exhausted *anonymous* quota with 403 as well, so the
+    // header — not the status — decides whether this is throttling or a real
+    // authorization problem. Mis-reporting a rate limit as "your connection
+    // needs renewing" sends the user chasing a problem that does not exist.
+    const exhausted = response.headers.get("x-ratelimit-remaining") === "0";
+    if (exhausted) {
+      throw new PlatformError(
+        "rate_limited",
+        "The platform is rate limiting requests. Try again shortly.",
+        true
+      );
+    }
     throw new PlatformError(
       "auth_required",
       "The platform refused this request. Your connection may need to be renewed.",
@@ -267,6 +284,231 @@ export async function platformFetchText(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Classification helpers                                              */
+/* ------------------------------------------------------------------ */
+
+type VerifyContext = {
+  /** Can this platform produce figures at all? */
+  statsAvailable: boolean;
+  /** May the user keep this as a saved link instead? Defaults to true. */
+  canSaveLink?: boolean;
+  /** Overrides the message used when the platform cannot be checked. */
+  unavailableMessage?: string;
+  /** The handle the user typed, echoed back when we resolved nothing better. */
+  fallbackUsername?: string;
+};
+
+/**
+ * Turn a thrown error into a classified verification result.
+ *
+ * Adapters call this from `verify()` so that no platform can accidentally
+ * report "no such account" for a timeout, a 500, or a missing credential.
+ */
+export function classifyVerifyFailure(
+  error: unknown,
+  ctx: VerifyContext
+): PlatformVerifyResult {
+  const canSaveLink = ctx.canSaveLink ?? true;
+  const base = {
+    exists: false as const,
+    username: ctx.fallbackUsername ?? null,
+    profileUrl: null,
+    statsAvailable: ctx.statsAvailable,
+    canSaveLink,
+  };
+
+  if (error instanceof PlatformError) {
+    switch (error.reason) {
+      case "not_found":
+        return {
+          ...base,
+          outcome: "INVALID_PROFILE",
+          canSaveLink: false,
+          message: "No profile with that username on this platform.",
+        };
+      case "rate_limited":
+        return {
+          ...base,
+          outcome: "RATE_LIMITED",
+          message: "Platform temporarily unavailable — it is rate limiting us. Please try again shortly.",
+        };
+      case "auth_required":
+        return {
+          ...base,
+          outcome: "CONFIGURATION_ERROR",
+          requiresOAuth: true,
+          message: error.message,
+        };
+      case "configuration_error":
+        return {
+          ...base,
+          outcome: "CONFIGURATION_ERROR",
+          message: error.message,
+        };
+      case "network":
+        return {
+          ...base,
+          outcome: "NETWORK_ERROR",
+          message: "Could not reach the platform. Check your connection and try again.",
+        };
+      default:
+        return {
+          ...base,
+          outcome: "VERIFICATION_UNAVAILABLE",
+          message:
+            ctx.unavailableMessage ??
+            "We could not verify this profile right now. You can still save the link.",
+        };
+    }
+  }
+
+  return {
+    ...base,
+    outcome: "VERIFICATION_UNAVAILABLE",
+    message:
+      ctx.unavailableMessage ??
+      "We could not verify this profile right now. You can still save the link.",
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Extra HTTP helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+/** A fetched HTML document plus where it actually ended up. */
+export type PlatformDocument = {
+  html: string;
+  /** The final URL after redirects — how we detect a bounce to a home page. */
+  finalUrl: string;
+  status: number;
+};
+
+/**
+ * Fetch a page that is expected to be HTML.
+ *
+ * Redirects are followed deliberately: several platforms answer a *missing*
+ * profile with a 302 to their home page rather than a 404, so the status code
+ * alone cannot tell "exists" from "does not exist". The final URL can.
+ */
+export async function platformFetchDocument(
+  url: string,
+  options: HttpOptions = {}
+): Promise<PlatformDocument> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 12_000);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: options.accept ?? "text/html,application/xhtml+xml",
+        ...options.headers,
+      },
+      signal: controller.signal,
+      redirect: "follow",
+      next: options.revalidate ? { revalidate: options.revalidate } : undefined,
+      cache: options.revalidate ? undefined : "no-store",
+    });
+    return {
+      html: await response.text(),
+      finalUrl: response.url || url,
+      status: response.status,
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new PlatformError("network", "The platform took too long to respond.", true);
+    }
+    throw new PlatformError("network", "Could not reach the platform.", true);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** The parsed body of a request that may legitimately fail with a JSON reason. */
+export type PlatformJsonResult<T> = {
+  status: number;
+  ok: boolean;
+  body: T | null;
+};
+
+/**
+ * Fetch JSON without throwing on 4xx.
+ *
+ * Needed wherever an API reports its own error inside the body at a non-200
+ * status — Codeforces answers a missing handle with HTTP 400 plus
+ * `{"status":"FAILED","comment":"…not found"}`. Treating that body as an
+ * opaque transport failure is what turned "no such handle" into "the platform
+ * returned an unexpected response".
+ */
+export async function platformFetchJsonResult<T>(
+  url: string,
+  options: HttpOptions = {}
+): Promise<PlatformJsonResult<T>> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 12_000);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: options.method ?? "GET",
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: options.accept ?? "application/json",
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...options.headers,
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal,
+      next: options.revalidate ? { revalidate: options.revalidate } : undefined,
+      cache: options.revalidate ? undefined : "no-store",
+    });
+  } catch (error) {
+    clearTimeout(timeout);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new PlatformError("network", "The platform took too long to respond.", true);
+    }
+    throw new PlatformError("network", "Could not reach the platform.", true);
+  }
+  clearTimeout(timeout);
+
+  if (response.status === 429) {
+    clearTimeout(timeout);
+    throw new PlatformError(
+      "rate_limited",
+      "The platform is rate limiting requests. Try again shortly.",
+      true
+    );
+  }
+
+  let body: T | null = null;
+  const text = await response.text();
+  if (text) {
+    try {
+      body = JSON.parse(text) as T;
+    } catch {
+      body = null;
+    }
+  }
+  return { status: response.status, ok: response.ok, body };
+}
+
+/** A verified result, built here so every adapter spells it the same way. */
+export function verifiedResult(input: {
+  username: string;
+  profileUrl: string | null;
+  message?: string;
+  statsAvailable: boolean;
+}): PlatformVerifyResult {
+  return {
+    outcome: "VERIFIED",
+    exists: true,
+    message: input.message ?? `@${input.username}`,
+    username: input.username,
+    profileUrl: input.profileUrl,
+    statsAvailable: input.statsAvailable,
+    canSaveLink: true,
+  };
 }
 
 /** YYYY-MM-DD for a Date, in UTC, matching Postgres `date`. */

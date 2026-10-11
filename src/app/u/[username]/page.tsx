@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
-import { queryOne } from "@/lib/db/pool";
-import { hasDatabase } from "@/lib/db/pool";
+import { hasDatabase } from "@/lib/db/prisma";
+import { loadPublicProfile } from "@/lib/db/public-profile";
 import { normalizeUsername } from "@/lib/validation";
 import { PublicProfile, type PublicProfileData } from "@/components/public/PublicProfile";
 import { HomeButton } from "@/components/HomeButton";
@@ -26,14 +26,7 @@ export default async function PublicProfilePage({ params }: Params) {
   let profile: PublicProfileData | null = null;
 
   if (handle && hasDatabase()) {
-    const row = await queryOne<{ devora_public_profile: PublicProfileData | null }>(
-      `select public.devora_public_profile($1) as devora_public_profile`,
-      [handle]
-    );
-    const value = row?.devora_public_profile;
-    if (value && typeof value === "object" && Object.keys(value).length > 0) {
-      profile = value;
-    }
+    profile = await loadPublicProfile(handle);
   }
 
   return (

@@ -2,38 +2,67 @@
  * Devora repository — every database read/write for the onboarding + dashboard
  * surface lives here so that route handlers stay thin and consistent.
  *
- * Two things are deliberately centralised:
+ * Data layer
+ * ----------
+ * This runs on MySQL through Prisma Client (src/lib/db/prisma.ts). It used to
+ * be hand-written Postgres SQL over node-postgres, which could not speak to the
+ * configured MySQL database at all — every request failed inside the pool
+ * before reaching any logic. The public API of this module is unchanged: the
+ * same 60 functions with the same signatures, so no caller had to change.
+ *
+ * Three things are still deliberately centralised:
  *   1. `stripServerFields` — onboarding_completed and the cached aggregates can
  *      never be echoed back into a client-writable payload.
  *   2. `recomputeAggregates` — dashboard numbers are derived from real rows
  *      (coding_stats / activity_daily / projects). Nothing is hardcoded.
+ *   3. `evaluateAchievements` — awards come from stored metrics only.
  */
 
 import "server-only";
-import { query, queryOne, withTransaction } from "@/lib/db/pool";
+import type { Profile as PrismaProfile } from "@prisma/client";
+import { prisma, Prisma } from "@/lib/db/prisma";
 import {
   DEFAULT_VISIBILITY,
-  type ActivityEventRow,
   type AchievementRow,
+  type AchievementSummary,
+  type ActivityEventRow,
   type ActivityPoint,
   type ActivityRange,
   type ConnectedPlatform,
+  type DailyActivity,
   type DevoraSocials,
   type DifficultyBreakdown,
+  type GitHubLanguage,
+  type GitHubOverview,
+  type LockedAchievement,
+  type MonthlyLeaderboardRow,
+  type MonthlyProgress,
   type NotificationRow,
+  type PersonalBests,
   type PlatformAccount,
+  type PlatformComparisonRow,
   type PlatformKey,
   type PlatformStats,
   type ProfileCompletionItem,
   type ProjectRow,
+  type StreakStats,
   type SyncStatus,
   type TopicProgressRow,
   type Visibility,
+  type YearlyOverview,
 } from "@/lib/types";
-import { ACTIVITY_RANGES } from "@/lib/types";
+import { ACTIVITY_RANGES, PLATFORM_BY_KEY } from "@/lib/types";
+import {
+  aggregateMonths,
+  computePersonalBests,
+  computeStreaks,
+  monthKeyOf,
+  monthLabel,
+  sumSeries,
+} from "@/lib/dashboard-metrics";
 
 /* ------------------------------------------------------------------ */
-/* Row shapes                                                          */
+/* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
 type ProfileRow = {
@@ -55,11 +84,84 @@ type ProfileRow = {
   onboarding_completed: boolean;
   onboarding_step: number;
   created_at: string;
+  /** Kept as a Date here: "first completed" is a moment, not a display string. */
+  onboardingCompletedAt: Date | null;
   total_solved: number;
   current_streak: number;
   longest_streak: number;
   github_contributions: number;
 };
+
+/**
+ * Prisma row -> the snake_case shape the rest of the app already reads.
+ *
+ * The column names match, so this is only about the two fields that differ:
+ * `visibility` (Json, cast to the app's Visibility map) and
+ * `onboarding_completed_at` (a Date, kept under its own camelCase key so
+ * `markProfileComplete` can preserve the original completion moment).
+ */
+function toProfileRow(row: PrismaProfile): ProfileRow {
+  return {
+    ...row,
+    visibility: (row.visibility ?? null) as Visibility | null,
+    onboardingCompletedAt: row.onboarding_completed_at,
+    created_at: row.created_at.toISOString(),
+  };
+}
+
+/** Prisma reports unique-index conflicts as P2002. */
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: string }).code === "P2002"
+  );
+}
+
+/** JSON columns reject `undefined`; they want a real value or SQL NULL. */
+function jsonInput(value: unknown): Prisma.InputJsonValue | typeof Prisma.JsonNull {
+  if (value === null || value === undefined) return Prisma.JsonNull;
+  return value as Prisma.InputJsonValue;
+}
+
+/** YYYY-MM-DD for a stored DATE column (Prisma returns midnight UTC). */
+function dayKey(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+/** DATE columns take a Date; midnight UTC keeps the calendar day stable. */
+function dayValue(day: string): Date {
+  return new Date(`${day}T00:00:00.000Z`);
+}
+
+function startOfDay(date: Date): Date {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function daysAgo(days: number, from = new Date()): Date {
+  const d = startOfDay(from);
+  d.setDate(d.getDate() - days);
+  return d;
+}
+
+/** Render a local-calendar YYYY-MM-DD (used to densify the activity series). */
+function localDayKey(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+    date.getDate()
+  ).padStart(2, "0")}`;
+}
+
+function toIso(value: unknown): string | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? (value as string[]) : [];
+}
 
 /* ------------------------------------------------------------------ */
 /* Profile                                                             */
@@ -72,39 +174,43 @@ export async function ensureProfile(
   /** OAuth avatar (e.g. Google picture) — used ONLY when creating the row. */
   avatarUrl?: string | null
 ): Promise<ProfileRow> {
-  const existing = await queryOne<ProfileRow>(
-    `select * from public.profiles where user_id = $1`,
-    [userId]
-  );
-  if (existing) return existing;
+  const existing = await prisma.profile.findUnique({ where: { user_id: userId } });
+  if (existing) return toProfileRow(existing);
 
-  await query(
-    `insert into public.profiles (user_id, display_name, email, avatar_url)
-     values ($1, $2, $3, $4)
-     on conflict (user_id) do nothing`,
-    [userId, fallbackName, email, avatarUrl ?? null]
-  );
-
-  const created = await queryOne<ProfileRow>(
-    `select * from public.profiles where user_id = $1`,
-    [userId]
-  );
-  if (!created) throw new Error("Could not create a Devora profile row.");
-  return created;
+  try {
+    const created = await prisma.profile.create({
+      // display_name is capped at 120 characters by the column; a Google name
+      // longer than that is trimmed rather than rejected.
+      data: {
+        user_id: userId,
+        display_name: fallbackName.slice(0, 120),
+        email: email ? email.slice(0, 320) : null,
+        avatar_url: avatarUrl ? avatarUrl.slice(0, 512) : null,
+      },
+    });
+    return toProfileRow(created);
+  } catch (error) {
+    // Two concurrent requests for a brand-new user race here; the loser simply
+    // reads the row the winner created.
+    if (isUniqueViolation(error)) {
+      const again = await prisma.profile.findUnique({ where: { user_id: userId } });
+      if (again) return toProfileRow(again);
+    }
+    throw error;
+  }
 }
 
 export async function getProfile(userId: string): Promise<ProfileRow | null> {
-  return queryOne<ProfileRow>(`select * from public.profiles where user_id = $1`, [
-    userId,
-  ]);
+  const row = await prisma.profile.findUnique({ where: { user_id: userId } });
+  return row ? toProfileRow(row) : null;
 }
 
 /** Authoritative onboarding check. Always read from the database. */
 export async function isOnboardingComplete(userId: string): Promise<boolean> {
-  const row = await queryOne<{ onboarding_completed: boolean }>(
-    `select onboarding_completed from public.profiles where user_id = $1`,
-    [userId]
-  );
+  const row = await prisma.profile.findUnique({
+    where: { user_id: userId },
+    select: { onboarding_completed: true },
+  });
   return row?.onboarding_completed === true;
 }
 
@@ -133,52 +239,47 @@ export async function updateProfile(
   userId: string,
   update: ProfileUpdate
 ): Promise<void> {
-  const sets: string[] = [];
-  const params: unknown[] = [];
-  let i = 1;
+  const data: Record<string, unknown> = {};
 
-  const push = (column: string, value: unknown) => {
-    sets.push(`${column} = $${i++}`);
-    params.push(value);
-  };
-
-  if (update.displayName !== undefined) push("display_name", update.displayName);
-  if (update.username !== undefined) push("display_username", update.username);
+  if (update.displayName !== undefined) data.display_name = update.displayName;
+  if (update.username !== undefined) data.display_username = update.username;
   if (update.usernameNormalized !== undefined)
-    push("username_normalized", update.usernameNormalized);
-  if (update.bio !== undefined) push("bio", update.bio);
+    data.username_normalized = update.usernameNormalized;
+  if (update.bio !== undefined) data.bio = update.bio;
   if (update.developerRole !== undefined)
-    push("developer_role", update.developerRole);
-  if (update.college !== undefined) push("college", update.college);
-  if (update.location !== undefined) push("location", update.location || null);
-  if (update.avatarUrl !== undefined) push("avatar_url", update.avatarUrl);
-  if (update.email !== undefined) push("email", update.email || null);
+    data.developer_role = update.developerRole;
+  if (update.college !== undefined) data.college = update.college;
+  if (update.location !== undefined) data.location = update.location || null;
+  if (update.avatarUrl !== undefined) data.avatar_url = update.avatarUrl;
+  if (update.email !== undefined) data.email = update.email || null;
 
   if (update.socials) {
     const s = update.socials;
-    if (s.linkedin !== undefined) push("linkedin_url", s.linkedin || null);
+    if (s.linkedin !== undefined) data.linkedin_url = s.linkedin || null;
     // NOTE: GitHub is stored as a `platform_accounts` row, not on the profile —
     // there is no github_url column, and writing it to portfolio_url would
     // clobber the user's actual portfolio link.
-    if (s.twitter !== undefined) push("twitter_url", s.twitter || null);
-    if (s.portfolio !== undefined) push("portfolio_url", s.portfolio || null);
+    if (s.twitter !== undefined) data.twitter_url = s.twitter || null;
+    if (s.portfolio !== undefined) data.portfolio_url = s.portfolio || null;
     if (s.website !== undefined && s.portfolio === undefined)
-      push("website", s.website || null);
-    if (s.email !== undefined) push("email", s.email || null);
+      data.website = s.website || null;
+    if (s.email !== undefined) data.email = s.email || null;
   }
 
   if (update.visibility) {
     const current = await getProfile(userId);
-    const merged = { ...(current?.visibility ?? DEFAULT_VISIBILITY), ...update.visibility };
-    push("visibility", JSON.stringify(merged));
+    const merged = {
+      ...(current?.visibility ?? DEFAULT_VISIBILITY),
+      ...update.visibility,
+    };
+    data.visibility = merged;
   }
 
-  if (sets.length === 0) return;
-  params.push(userId);
-  await query(
-    `update public.profiles set ${sets.join(", ")} where user_id = $${i}`,
-    params
-  );
+  if (Object.keys(data).length === 0) return;
+  await prisma.profile.update({
+    where: { user_id: userId },
+    data: data as Prisma.ProfileUpdateInput,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -236,10 +337,10 @@ export async function checkUsername(
     };
   }
 
-  const taken = await queryOne<{ user_id: string }>(
-    `select user_id from public.username_registry where username_normalized = $1`,
-    [username]
-  );
+  const taken = await prisma.usernameRegistry.findUnique({
+    where: { username_normalized: username },
+    select: { user_id: true },
+  });
 
   if (taken && taken.user_id !== forUserId) {
     return {
@@ -261,7 +362,7 @@ export async function checkUsername(
 /**
  * Claim a handle atomically.
  *
- * The insert into username_registry is the lock: two users racing for the same
+ * The username_registry primary key is the lock: two users racing for the same
  * handle will have exactly one winner. The transaction rolls back the whole
  * claim on conflict, so the registry and profiles never disagree.
  */
@@ -271,35 +372,25 @@ export async function claimUsername(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const normalized = username.toLowerCase();
   try {
-    await withTransaction(async (client) => {
-      await client.query(
-        `insert into public.username_registry (username_normalized, username, user_id)
-         values ($1, $2, $3)`,
-        [normalized, username, userId]
-      );
-      await client.query(
-        `update public.profiles
-            set display_username = $1, username_normalized = $2
-          where user_id = $3`,
-        [username, normalized, userId]
-      );
+    await prisma.$transaction(async (tx) => {
+      await tx.usernameRegistry.create({
+        data: { username_normalized: normalized, username, user_id: userId },
+      });
+      await tx.profile.update({
+        where: { user_id: userId },
+        data: { display_username: username, username_normalized: normalized },
+      });
     });
     return { ok: true };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.includes("username_registry_pkey") || message.includes("duplicate key")) {
-      return { ok: false, error: "Username already taken." };
-    }
-    if (message.includes("profiles_username_normalized_key")) {
-      return { ok: false, error: "Username already taken." };
-    }
+    if (isUniqueViolation(error)) return { ok: false, error: "Username already taken." };
     return { ok: false, error: "Could not save that username." };
   }
 }
 
 /** Release the previous handle when a user renames themselves. */
 export async function releaseUsername(userId: string): Promise<void> {
-  await query(`delete from public.username_registry where user_id = $1`, [userId]);
+  await prisma.usernameRegistry.deleteMany({ where: { user_id: userId } });
 }
 
 /* ------------------------------------------------------------------ */
@@ -307,15 +398,12 @@ export async function releaseUsername(userId: string): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 export async function getSkills(userId: string): Promise<string[]> {
-  const rows = await query<{ name: string; custom_name: string | null }>(
-    `select s.name, us.custom_name
-       from public.user_skills us
-       join public.skills s on s.id = us.skill_id
-      where us.user_id = $1
-      order by us.position, s.name`,
-    [userId]
-  );
-  return rows.map((r) => r.custom_name || r.name);
+  const rows = await prisma.userSkill.findMany({
+    where: { user_id: userId },
+    include: { skill: true },
+    orderBy: [{ position: "asc" }, { skill: { name: "asc" } }],
+  });
+  return rows.map((r) => r.custom_name || r.skill.name);
 }
 
 /**
@@ -327,40 +415,49 @@ export async function getSkills(userId: string): Promise<string[]> {
  */
 export async function setSkills(userId: string, names: string[]): Promise<void> {
   if (names.length === 0) {
-    await query(`delete from public.user_skills where user_id = $1`, [userId]);
+    await prisma.userSkill.deleteMany({ where: { user_id: userId } });
     return;
   }
 
-  await withTransaction(async (client) => {
-    const skillIds: string[] = [];
-    for (const name of names) {
-      const slug = name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 60);
-      if (!slug) continue;
+  const skillIds: string[] = [];
+  for (const name of names) {
+    const slug = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60);
+    if (!slug) continue;
 
-      const { rows } = await client.query<{ id: string }>(
-        `insert into public.skills (slug, name, category)
-         values ($1, $2, 'custom')
-         on conflict (slug) do update set name = public.skills.name
-         returning id`,
-        [slug, name]
-      );
-      if (rows[0]) skillIds.push(rows[0].id);
+    // Upsert that KEEPS the existing catalogue name (the old SQL did
+    // `do update set name = skills.name`, i.e. a no-op update).
+    const existing = await prisma.skill.findUnique({ where: { slug } });
+    if (existing) {
+      skillIds.push(existing.id);
+      continue;
     }
+    try {
+      const created = await prisma.skill.create({
+        data: { slug, name, category: "custom" },
+      });
+      skillIds.push(created.id);
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+      const raced = await prisma.skill.findUnique({ where: { slug } });
+      if (raced) skillIds.push(raced.id);
+    }
+  }
 
-    await client.query(`delete from public.user_skills where user_id = $1`, [userId]);
-
-    let position = 0;
-    for (const skillId of skillIds) {
-      await client.query(
-        `insert into public.user_skills (user_id, skill_id, position)
-         values ($1, $2, $3)
-         on conflict (user_id, skill_id) do nothing`,
-        [userId, skillId, position++]
-      );
+  await prisma.$transaction(async (tx) => {
+    await tx.userSkill.deleteMany({ where: { user_id: userId } });
+    if (skillIds.length > 0) {
+      await tx.userSkill.createMany({
+        data: skillIds.map((skillId, index) => ({
+          user_id: userId,
+          skill_id: skillId,
+          position: index,
+        })),
+        skipDuplicates: true,
+      });
     }
   });
 }
@@ -368,9 +465,10 @@ export async function setSkills(userId: string, names: string[]): Promise<void> 
 export async function getSkillCatalogue(): Promise<
   { slug: string; name: string; category: string }[]
 > {
-  return query(
-    `select slug, name, category from public.skills order by category, name`
-  );
+  return prisma.skill.findMany({
+    select: { slug: true, name: true, category: true },
+    orderBy: [{ category: "asc" }, { name: "asc" }],
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -391,26 +489,6 @@ type PlatformAccountRow = {
   connected_at: string;
 };
 
-type CodingStatsRow = {
-  platform: PlatformKey;
-  solved_total: number | null;
-  solved_easy: number | null;
-  solved_medium: number | null;
-  solved_hard: number | null;
-  rating: number | null;
-  max_rating: number | null;
-  rank_label: string | null;
-  contests: number | null;
-  badges: number | null;
-  reputation: number | null;
-  followers: number | null;
-  public_repos: number | null;
-  contributions: number | null;
-  streak_current: number | null;
-  streak_longest: number | null;
-  fetched_at: string;
-};
-
 function toAccount(row: PlatformAccountRow): PlatformAccount {
   return {
     id: row.id,
@@ -427,52 +505,49 @@ function toAccount(row: PlatformAccountRow): PlatformAccount {
   };
 }
 
-function toStats(row: CodingStatsRow | undefined): PlatformStats | null {
+function toStats(row: Record<string, unknown> | undefined): PlatformStats | null {
   if (!row) return null;
   return {
-    platform: row.platform,
-    solvedTotal: row.solved_total,
-    solvedEasy: row.solved_easy,
-    solvedMedium: row.solved_medium,
-    solvedHard: row.solved_hard,
-    rating: row.rating,
-    maxRating: row.max_rating,
-    rankLabel: row.rank_label,
-    contests: row.contests,
-    badges: row.badges,
-    reputation: row.reputation,
-    followers: row.followers,
-    publicRepos: row.public_repos,
-    contributions: row.contributions,
-    streakCurrent: row.streak_current,
-    streakLongest: row.streak_longest,
-    fetchedAt: row.fetched_at,
+    platform: row.platform as PlatformKey,
+    solvedTotal: (row.solved_total ?? null) as number | null,
+    solvedEasy: (row.solved_easy ?? null) as number | null,
+    solvedMedium: (row.solved_medium ?? null) as number | null,
+    solvedHard: (row.solved_hard ?? null) as number | null,
+    rating: (row.rating ?? null) as number | null,
+    maxRating: (row.max_rating ?? null) as number | null,
+    rankLabel: (row.rank_label ?? null) as string | null,
+    contests: (row.contests ?? null) as number | null,
+    badges: (row.badges ?? null) as number | null,
+    reputation: (row.reputation ?? null) as number | null,
+    followers: (row.followers ?? null) as number | null,
+    publicRepos: (row.public_repos ?? null) as number | null,
+    contributions: (row.contributions ?? null) as number | null,
+    streakCurrent: (row.streak_current ?? null) as number | null,
+    streakLongest: (row.streak_longest ?? null) as number | null,
+    fetchedAt: toIso(row.fetched_at),
   };
 }
 
 export async function getConnectedPlatforms(
   userId: string
 ): Promise<ConnectedPlatform[]> {
-  const { PLATFORM_BY_KEY } = await import("@/lib/types");
-
-  const accounts = await query<PlatformAccountRow>(
-    `select * from public.platform_accounts
-      where user_id = $1 and connection_status <> 'disconnected'
-      order by connected_at`,
-    [userId]
-  );
+  const accounts = await prisma.platformAccount.findMany({
+    where: { user_id: userId, connection_status: { not: "disconnected" } },
+    orderBy: { connected_at: "asc" },
+  });
   if (accounts.length === 0) return [];
 
-  const stats = await query<CodingStatsRow>(
-    `select * from public.coding_stats where user_id = $1`,
-    [userId]
-  );
+  const stats = await prisma.codingStat.findMany({ where: { user_id: userId } });
   const byPlatform = new Map(stats.map((s) => [s.platform, s]));
 
   return accounts.map((row) => ({
-    account: toAccount(row),
-    stats: toStats(byPlatform.get(row.platform)),
-    meta: PLATFORM_BY_KEY[row.platform],
+    account: toAccount({
+      ...row,
+      last_synced_at: toIso(row.last_synced_at),
+      connected_at: row.connected_at.toISOString(),
+    } as unknown as PlatformAccountRow),
+    stats: toStats(byPlatform.get(row.platform) as unknown as Record<string, unknown>),
+    meta: PLATFORM_BY_KEY[row.platform as PlatformKey],
   }));
 }
 
@@ -480,10 +555,22 @@ export async function getPlatformAccount(
   userId: string,
   platform: PlatformKey
 ): Promise<PlatformAccountRow | null> {
-  return queryOne<PlatformAccountRow>(
-    `select * from public.platform_accounts where user_id = $1 and platform = $2`,
-    [userId, platform]
-  );
+  const row = await prisma.platformAccount.findUnique({
+    where: { user_id_platform: { user_id: userId, platform } },
+  });
+  if (!row) return null;
+  return {
+    ...row,
+    last_synced_at: toIso(row.last_synced_at),
+    connected_at: row.connected_at.toISOString(),
+  } as unknown as PlatformAccountRow;
+}
+
+function normaliseConnectionStatus(value?: string): string {
+  if (value === "linked" || value === "connected" || value === "disconnected") {
+    return value;
+  }
+  return "connected";
 }
 
 export async function upsertPlatformAccount(input: {
@@ -496,63 +583,43 @@ export async function upsertPlatformAccount(input: {
   authType: "oauth" | "public";
   connectionStatus?: string;
 }): Promise<string> {
-  const rows = await query<{ id: string }>(
-    `insert into public.platform_accounts
-       (user_id, platform, username, external_user_id, profile_url, avatar_url,
-        auth_type, connection_status, sync_status)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, 'idle')
-     on conflict (user_id, platform) do update set
-       username = excluded.username,
-       external_user_id = coalesce(excluded.external_user_id, public.platform_accounts.external_user_id),
-       profile_url = excluded.profile_url,
-       avatar_url = coalesce(excluded.avatar_url, public.platform_accounts.avatar_url),
-       auth_type = excluded.auth_type,
-       connection_status = excluded.connection_status,
-       sync_status = 'idle',
-       sync_error = null
-     returning id`,
-    [
-      input.userId,
-      input.platform,
-      input.username,
-      input.externalUserId ?? null,
-      input.profileUrl ?? null,
-      input.avatarUrl ?? null,
-      input.authType,
-      input.connectionStatus ?? "connected",
-    ]
-  );
-  return rows[0].id;
+  const where = { user_id_platform: { user_id: input.userId, platform: input.platform } };
+  const existing = await prisma.platformAccount.findUnique({ where });
+
+  // `coalesce(excluded.x, existing.x)` for the two identity fields we must not
+  // lose, while the rest are overwritten outright — same as the old SQL.
+  const shared = {
+    username: input.username,
+    external_user_id: input.externalUserId ?? existing?.external_user_id ?? null,
+    profile_url: input.profileUrl ?? null,
+    avatar_url: input.avatarUrl ?? existing?.avatar_url ?? null,
+    auth_type: input.authType,
+    connection_status: normaliseConnectionStatus(input.connectionStatus),
+    sync_status: "idle",
+    sync_error: null,
+  };
+
+  const row = await prisma.platformAccount.upsert({
+    where,
+    create: { user_id: input.userId, platform: input.platform, ...shared },
+    update: shared,
+  });
+  return row.id;
 }
 
 export async function markAccountDisconnected(
   userId: string,
   platform: PlatformKey
 ): Promise<void> {
-  await withTransaction(async (client) => {
-    await client.query(
-      `delete from public.platform_oauth_tokens
-        where user_id = $1 and platform = $2`,
-      [userId, platform]
-    );
-    await client.query(
-      `delete from public.coding_stats where user_id = $1 and platform = $2`,
-      [userId, platform]
-    );
-    await client.query(
-      `delete from public.activity_daily where user_id = $1 and platform = $2`,
-      [userId, platform]
-    );
-    await client.query(
-      `delete from public.platform_accounts where user_id = $1 and platform = $2`,
-      [userId, platform]
-    );
-    await client.query(
-      `delete from public.sync_jobs
-        where user_id = $1 and platform = $2 and status in ('queued','running')`,
-      [userId, platform]
-    );
-  });
+  await prisma.$transaction([
+    prisma.platformOauthToken.deleteMany({ where: { user_id: userId, platform } }),
+    prisma.codingStat.deleteMany({ where: { user_id: userId, platform } }),
+    prisma.activityDaily.deleteMany({ where: { user_id: userId, platform } }),
+    prisma.syncJob.deleteMany({
+      where: { user_id: userId, platform, status: { in: ["queued", "running"] } },
+    }),
+    prisma.platformAccount.deleteMany({ where: { user_id: userId, platform } }),
+  ]);
   await recomputeAggregates(userId);
 }
 
@@ -562,14 +629,15 @@ export async function setSyncState(
   status: SyncStatus,
   error?: string | null
 ): Promise<void> {
-  await query(
-    `update public.platform_accounts
-        set sync_status = $1,
-            sync_error = $2,
-            last_synced_at = case when $1 = 'ok' then now() else last_synced_at end
-      where user_id = $3 and platform = $4`,
-    [status, error ?? null, userId, platform]
-  );
+  await prisma.platformAccount.updateMany({
+    where: { user_id: userId, platform },
+    data: {
+      sync_status: status,
+      sync_error: error ?? null,
+      // Only a successful sync moves the "last synced" clock.
+      ...(status === "ok" ? { last_synced_at: new Date() } : {}),
+    },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -586,54 +654,32 @@ export async function upsertCodingStats(
   platform: PlatformKey,
   stats: NormalizedStats
 ): Promise<void> {
-  await query(
-    `insert into public.coding_stats (
-       user_id, platform_account_id, platform, solved_total, solved_easy,
-       solved_medium, solved_hard, rating, max_rating, rank_label, contests,
-       badges, reputation, followers, public_repos, contributions,
-       streak_current, streak_longest, raw, fetched_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19, now())
-     on conflict (user_id, platform) do update set
-       platform_account_id = excluded.platform_account_id,
-       solved_total = excluded.solved_total,
-       solved_easy = excluded.solved_easy,
-       solved_medium = excluded.solved_medium,
-       solved_hard = excluded.solved_hard,
-       rating = excluded.rating,
-       max_rating = excluded.max_rating,
-       rank_label = excluded.rank_label,
-       contests = excluded.contests,
-       badges = excluded.badges,
-       reputation = excluded.reputation,
-       followers = excluded.followers,
-       public_repos = excluded.public_repos,
-       contributions = excluded.contributions,
-       streak_current = excluded.streak_current,
-       streak_longest = excluded.streak_longest,
-       raw = excluded.raw,
-       fetched_at = now()`,
-    [
-      userId,
-      platformAccountId,
-      platform,
-      stats.solvedTotal,
-      stats.solvedEasy,
-      stats.solvedMedium,
-      stats.solvedHard,
-      stats.rating,
-      stats.maxRating,
-      stats.rankLabel,
-      stats.contests,
-      stats.badges,
-      stats.reputation,
-      stats.followers,
-      stats.publicRepos,
-      stats.contributions,
-      stats.streakCurrent,
-      stats.streakLongest,
-      stats.raw ? JSON.stringify(stats.raw) : null,
-    ]
-  );
+  const shared = {
+    platform_account_id: platformAccountId,
+    solved_total: stats.solvedTotal,
+    solved_easy: stats.solvedEasy,
+    solved_medium: stats.solvedMedium,
+    solved_hard: stats.solvedHard,
+    rating: stats.rating,
+    max_rating: stats.maxRating,
+    rank_label: stats.rankLabel,
+    contests: stats.contests,
+    badges: stats.badges,
+    reputation: stats.reputation,
+    followers: stats.followers,
+    public_repos: stats.publicRepos,
+    contributions: stats.contributions,
+    streak_current: stats.streakCurrent,
+    streak_longest: stats.streakLongest,
+    raw: jsonInput(stats.raw ?? null),
+    fetched_at: new Date(),
+  };
+
+  await prisma.codingStat.upsert({
+    where: { user_id_platform: { user_id: userId, platform } },
+    create: { user_id: userId, platform, ...shared },
+    update: shared,
+  });
 }
 
 export async function replaceDailyActivity(
@@ -642,18 +688,30 @@ export async function replaceDailyActivity(
   days: { day: string; count: number; difficulty?: Record<string, number> }[]
 ): Promise<void> {
   if (days.length === 0) return;
-  await withTransaction(async (client) => {
-    for (const d of days) {
-      await client.query(
-        `insert into public.activity_daily (user_id, platform, day, count, difficulty)
-         values ($1, $2, $3, $4, $5)
-         on conflict (user_id, platform, day) do update set
-           count = excluded.count,
-           difficulty = excluded.difficulty`,
-        [userId, platform, d.day, d.count, JSON.stringify(d.difficulty ?? {})]
-      );
-    }
-  });
+  await prisma.$transaction(
+    days.map((d) =>
+      prisma.activityDaily.upsert({
+        where: {
+          user_id_platform_day: {
+            user_id: userId,
+            platform,
+            day: dayValue(d.day),
+          },
+        },
+        create: {
+          user_id: userId,
+          platform,
+          day: dayValue(d.day),
+          count: d.count,
+          difficulty: jsonInput(d.difficulty ?? {}),
+        },
+        update: {
+          count: d.count,
+          difficulty: jsonInput(d.difficulty ?? {}),
+        },
+      })
+    )
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -665,68 +723,80 @@ export async function replaceDailyActivity(
  *
  * Sources: coding_stats (per-platform totals, streaks, GitHub contributions)
  * and activity_daily (the authoritative daily series). If a platform reports
- * nothing, the aggregate stays null rather than inventing a figure.
+ * nothing, the aggregate stays 0 rather than inventing a figure.
  */
 export async function recomputeAggregates(userId: string): Promise<void> {
-  const totals = await queryOne<{
-    solved: number | null;
-    longest: number | null;
-    contributions: number | null;
-  }>(
-    `select
-       sum(coalesce(solved_total, 0)) filter (where solved_total is not null) as solved,
-       max(coalesce(streak_longest, 0)) filter (where streak_longest is not null) as longest,
-       max(coalesce(contributions, 0)) filter (where contributions is not null) as contributions
-     from public.coding_stats
-     where user_id = $1`,
-    [userId]
+  const stats = await prisma.codingStat.findMany({
+    where: { user_id: userId },
+    select: {
+      solved_total: true,
+      streak_longest: true,
+      streak_current: true,
+      contributions: true,
+    },
+  });
+
+  // `sum(...) filter (where x is not null)` — SUM already ignores NULLs, and
+  // MAX ignores them too, so a plain reduce is the same rule.
+  const solvedTotals = stats
+    .map((s) => s.solved_total)
+    .filter((v): v is number => v !== null);
+  const longestStreaks = stats
+    .map((s) => s.streak_longest)
+    .filter((v): v is number => v !== null);
+  const contributionValues = stats
+    .map((s) => s.contributions)
+    .filter((v): v is number => v !== null);
+
+  const solved = solvedTotals.reduce((a, b) => a + b, 0);
+  const longest = longestStreaks.length > 0 ? Math.max(...longestStreaks) : 0;
+  const contributions =
+    contributionValues.length > 0 ? Math.max(...contributionValues) : 0;
+
+  /**
+   * Current streak = consecutive days of activity ending today.
+   *
+   * The old Postgres version counted activity days against a day number that
+   * advanced over *every* stored day, so a gap silently failed to reset the
+   * run. This counts an actual unbroken run, which is what the dashboard's own
+   * streak maths (computeStreaks) reports — the two can no longer disagree.
+   */
+  const dailyRows = await prisma.activityDaily.groupBy({
+    by: ["day"],
+    where: { user_id: userId },
+    _sum: { count: true },
+  });
+  const activeDays = new Set(
+    dailyRows
+      .filter((r) => (r._sum.count ?? 0) > 0)
+      .map((r) => dayKey(r.day))
   );
 
-  /** Current streak = consecutive days with activity, counting back from now. */
-  const streakRow = await queryOne<{ current: number | null }>(
-    `with days as (
-       select day, sum(count) as total
-         from public.activity_daily
-        where user_id = $1
-        group by day
-     ), ordered as (
-       select day, total, row_number() over (order by day desc) as rn
-         from days
-     )
-     select count(*) as current
-       from ordered
-      where total > 0
-        and day >= (current_date - (rn - 1) * interval '1 day')`,
-    [userId]
-  );
+  let consecutive = 0;
+  const cursor = startOfDay(new Date());
+  while (activeDays.has(localDayKey(cursor)) && consecutive < 4000) {
+    consecutive += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
 
-  const platformStreak = await queryOne<{ streak: number | null }>(
-    `select max(coalesce(streak_current, 0)) as streak
-       from public.coding_stats where user_id = $1 and streak_current is not null`,
-    [userId]
-  );
-
+  const platformStreaks = stats
+    .map((s) => s.streak_current)
+    .filter((v): v is number => v !== null);
   const currentStreak = Math.max(
-    streakRow?.current ?? 0,
-    platformStreak?.streak ?? 0
+    consecutive,
+    platformStreaks.length > 0 ? Math.max(...platformStreaks) : 0
   );
 
-  await query(
-    `update public.profiles
-        set total_solved = $2,
-            longest_streak = $3,
-            current_streak = $4,
-            github_contributions = $5,
-            aggregates_updated_at = now()
-      where user_id = $1`,
-    [
-      userId,
-      totals?.solved ?? 0,
-      totals?.longest ?? 0,
-      currentStreak,
-      totals?.contributions ?? 0,
-    ]
-  );
+  await prisma.profile.update({
+    where: { user_id: userId },
+    data: {
+      total_solved: solved,
+      longest_streak: longest,
+      current_streak: currentStreak,
+      github_contributions: contributions,
+      aggregates_updated_at: new Date(),
+    },
+  });
 
   await updateProfileCompletion(userId);
 }
@@ -743,24 +813,16 @@ export async function computeProfileCompletion(
     return { percent: 0, items: [] };
   }
 
-  const skillCount = await queryOne<{ n: string }>(
-    `select count(*)::text as n from public.user_skills where user_id = $1`,
-    [userId]
-  );
-  const platformCount = await queryOne<{ n: string }>(
-    `select count(*)::text as n from public.platform_accounts
-      where user_id = $1 and connection_status = 'connected'`,
-    [userId]
-  );
-  const githubCount = await queryOne<{ n: string }>(
-    `select count(*)::text as n from public.platform_accounts
-      where user_id = $1 and platform = 'github' and connection_status = 'connected'`,
-    [userId]
-  );
-  const projectCount = await queryOne<{ n: string }>(
-    `select count(*)::text as n from public.projects where user_id = $1`,
-    [userId]
-  );
+  const [skillCount, platformCount, githubCount, projectCount] = await Promise.all([
+    prisma.userSkill.count({ where: { user_id: userId } }),
+    prisma.platformAccount.count({
+      where: { user_id: userId, connection_status: "connected" },
+    }),
+    prisma.platformAccount.count({
+      where: { user_id: userId, platform: "github", connection_status: "connected" },
+    }),
+    prisma.project.count({ where: { user_id: userId } }),
+  ]);
 
   const hasSocial = Boolean(
     profile.linkedin_url || profile.portfolio_url || profile.twitter_url || profile.website
@@ -771,14 +833,11 @@ export async function computeProfileCompletion(
     { label: "Display name", done: Boolean(profile.display_name?.trim()) },
     { label: "Username", done: Boolean(profile.display_username) },
     { label: "Bio", done: Boolean(profile.bio?.trim()) },
-    { label: "Skills", done: Number(skillCount?.n ?? 0) > 0 },
-    {
-      label: "At least one coding platform",
-      done: Number(platformCount?.n ?? 0) > 0,
-    },
-    { label: "GitHub connected", done: Number(githubCount?.n ?? 0) > 0 },
+    { label: "Skills", done: skillCount > 0 },
+    { label: "At least one coding platform", done: platformCount > 0 },
+    { label: "GitHub connected", done: githubCount > 0 },
     { label: "Social link", done: hasSocial },
-    { label: "At least one project", done: Number(projectCount?.n ?? 0) > 0 },
+    { label: "At least one project", done: projectCount > 0 },
   ];
 
   const done = items.filter((i) => i.done).length;
@@ -788,10 +847,10 @@ export async function computeProfileCompletion(
 
 export async function updateProfileCompletion(userId: string): Promise<number> {
   const { percent } = await computeProfileCompletion(userId);
-  await query(`update public.profiles set profile_completion = $2 where user_id = $1`, [
-    userId,
-    percent,
-  ]);
+  await prisma.profile.update({
+    where: { user_id: userId },
+    data: { profile_completion: percent },
+  });
   return percent;
 }
 
@@ -802,22 +861,17 @@ export async function updateProfileCompletion(userId: string): Promise<number> {
 export async function getDifficultyBreakdown(
   userId: string
 ): Promise<DifficultyBreakdown> {
-  const rows = await query<{
-    easy: number | null;
-    medium: number | null;
-    hard: number | null;
-  }>(
-    `select
-       sum(coalesce(solved_easy, 0)) filter (where solved_easy is not null) as easy,
-       sum(coalesce(solved_medium, 0)) filter (where solved_medium is not null) as medium,
-       sum(coalesce(solved_hard, 0)) filter (where solved_hard is not null) as hard
-     from public.coding_stats where user_id = $1`,
-    [userId]
-  );
+  const rows = await prisma.codingStat.findMany({
+    where: { user_id: userId },
+    select: { solved_easy: true, solved_medium: true, solved_hard: true },
+  });
 
-  const easy = rows[0]?.easy ?? 0;
-  const medium = rows[0]?.medium ?? 0;
-  const hard = rows[0]?.hard ?? 0;
+  const sum = (pick: (r: (typeof rows)[number]) => number | null) =>
+    rows.reduce((total, row) => total + (pick(row) ?? 0), 0);
+
+  const easy = sum((r) => r.solved_easy);
+  const medium = sum((r) => r.solved_medium);
+  const hard = sum((r) => r.solved_hard);
   const total = easy + medium + hard;
 
   // Never present a chart built from nothing — the UI shows an empty state.
@@ -829,37 +883,36 @@ export async function getActivitySeries(
   range: ActivityRange
 ): Promise<ActivityPoint[]> {
   const days = ACTIVITY_RANGES.find((r) => r.key === range)?.days ?? 30;
-  const rows = await query<{ day: string; count: string }>(
-    `select to_char(day, 'YYYY-MM-DD') as day, sum(count)::text as count
-       from public.activity_daily
-      where user_id = $1 and day >= (current_date - ($2::int - 1) * interval '1 day')
-      group by day
-      order by day`,
-    [userId, days]
-  );
+  const from = daysAgo(days - 1);
 
-  const byDay = new Map(rows.map((r) => [r.day, Number(r.count)]));
+  const rows = await prisma.activityDaily.findMany({
+    where: { user_id: userId, day: { gte: from } },
+    select: { day: true, count: true },
+  });
+
+  const byDay = new Map<string, number>();
+  for (const row of rows) {
+    const key = dayKey(row.day);
+    byDay.set(key, (byDay.get(key) ?? 0) + row.count);
+  }
 
   // Densify so the chart shows a continuous axis of real (including zero) days.
   const out: ActivityPoint[] = [];
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const today = startOfDay(new Date());
   for (let offset = days - 1; offset >= 0; offset--) {
     const d = new Date(today);
     d.setDate(d.getDate() - offset);
-    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-      d.getDate()
-    ).padStart(2, "0")}`;
+    const key = localDayKey(d);
     out.push({ day: key, count: byDay.get(key) ?? 0 });
   }
   return out;
 }
 
 export async function getTopicProgress(userId: string): Promise<TopicProgressRow[]> {
-  const rows = await query<{ topic: string; solved: number; total: number }>(
-    `select topic, solved, total from public.topic_progress where user_id = $1`,
-    [userId]
-  );
+  const rows = await prisma.topicProgress.findMany({
+    where: { user_id: userId },
+    select: { topic: true, solved: true, total: true },
+  });
   return rows.map((r) => ({ topic: r.topic, solved: r.solved, total: r.total }));
 }
 
@@ -867,21 +920,22 @@ export async function getTopicProgress(userId: string): Promise<TopicProgressRow
 export async function deriveTopicProgressFromTracker(
   userId: string
 ): Promise<TopicProgressRow[]> {
-  const rows = await query<{ topic: string; solved: string; total: string }>(
-    `select q.topic,
-            count(*) filter (where uq.status = 'solved')::text as solved,
-            count(*)::text as total
-       from public.user_questions uq
-       join public.questions q on q.id = uq.question_id
-      where uq.user_id = $1 and q.topic is not null
-      group by q.topic`,
-    [userId]
-  );
-  return rows.map((r) => ({
-    topic: r.topic,
-    solved: Number(r.solved),
-    total: Number(r.total),
-  }));
+  const rows = await prisma.userQuestion.findMany({
+    where: { user_id: userId, question: { topic: { not: null } } },
+    include: { question: { select: { topic: true } } },
+  });
+
+  const byTopic = new Map<string, { solved: number; total: number }>();
+  for (const row of rows) {
+    const topic = row.question.topic;
+    if (!topic) continue;
+    const entry = byTopic.get(topic) ?? { solved: 0, total: 0 };
+    entry.total += 1;
+    if (row.status === "solved") entry.solved += 1;
+    byTopic.set(topic, entry);
+  }
+
+  return [...byTopic.entries()].map(([topic, counts]) => ({ topic, ...counts }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -892,28 +946,18 @@ export async function getActivityEvents(
   userId: string,
   limit = 12
 ): Promise<ActivityEventRow[]> {
-  const rows = await query<{
-    id: string;
-    kind: ActivityEventRow["kind"];
-    title: string;
-    detail: string | null;
-    href: string | null;
-    occurred_at: string;
-  }>(
-    `select id, kind, title, detail, href, occurred_at
-       from public.activity_events
-      where user_id = $1
-      order by occurred_at desc
-      limit $2`,
-    [userId, limit]
-  );
+  const rows = await prisma.activityEvent.findMany({
+    where: { user_id: userId },
+    orderBy: { occurred_at: "desc" },
+    take: limit,
+  });
   return rows.map((r) => ({
     id: r.id,
-    kind: r.kind,
+    kind: r.kind as ActivityEventRow["kind"],
     title: r.title,
     detail: r.detail,
     href: r.href,
-    occurredAt: r.occurred_at,
+    occurredAt: r.occurred_at.toISOString(),
   }));
 }
 
@@ -926,76 +970,51 @@ export async function recordActivityEvent(input: {
   metadata?: Record<string, unknown>;
   occurredAt?: string;
 }): Promise<void> {
-  await query(
-    `insert into public.activity_events (user_id, kind, title, detail, href, metadata, occurred_at)
-     values ($1,$2,$3,$4,$5,$6, coalesce($7::timestamptz, now()))`,
-    [
-      input.userId,
-      input.kind,
-      input.title,
-      input.detail ?? null,
-      input.href ?? null,
-      JSON.stringify(input.metadata ?? {}),
-      input.occurredAt ?? null,
-    ]
-  );
+  await prisma.activityEvent.create({
+    data: {
+      user_id: input.userId,
+      kind: input.kind,
+      title: input.title,
+      detail: input.detail ?? null,
+      href: input.href ?? null,
+      metadata: jsonInput(input.metadata ?? {}),
+      occurred_at: input.occurredAt ? new Date(input.occurredAt) : new Date(),
+    },
+  });
 }
 
 export async function getProjects(userId: string): Promise<ProjectRow[]> {
-  const rows = await query<{
-    id: string;
-    name: string;
-    description: string;
-    tech_stack: string[];
-    image_url: string | null;
-    github_url: string | null;
-    live_url: string | null;
-    is_featured: boolean;
-    source: "manual" | "github";
-    created_at: string;
-  }>(
-    `select * from public.projects
-      where user_id = $1
-      order by is_featured desc, created_at desc`,
-    [userId]
-  );
+  const rows = await prisma.project.findMany({
+    where: { user_id: userId },
+    orderBy: [{ is_featured: "desc" }, { created_at: "desc" }],
+  });
   return rows.map((r) => ({
     id: r.id,
     name: r.name,
     description: r.description,
-    techStack: r.tech_stack ?? [],
+    techStack: asStringArray(r.tech_stack),
     imageUrl: r.image_url,
     githubUrl: r.github_url,
     liveUrl: r.live_url,
     isFeatured: r.is_featured,
-    source: r.source,
-    createdAt: r.created_at,
+    source: r.source as ProjectRow["source"],
+    createdAt: r.created_at.toISOString(),
   }));
 }
 
 export async function getAchievements(userId: string): Promise<AchievementRow[]> {
-  const rows = await query<{
-    code: string;
-    title: string;
-    description: string;
-    icon: string;
-    tier: string;
-    unlocked_at: string;
-  }>(
-    `select a.code, a.title, a.description, a.icon, a.tier, ua.unlocked_at
-       from public.user_achievements ua
-       join public.achievements a on a.id = ua.achievement_id
-      where ua.user_id = $1
-      order by ua.unlocked_at desc`,
-    [userId]
-  );
+  const rows = await prisma.userAchievement.findMany({
+    where: { user_id: userId },
+    include: { achievement: true },
+    orderBy: { unlocked_at: "desc" },
+  });
   return rows.map((r) => ({
-    code: r.code,
-    title: r.title,
-    description: r.description,
-    icon: r.icon,
-    tier: r.tier,
-    unlockedAt: r.unlocked_at,
+    code: r.achievement.code,
+    title: r.achievement.title,
+    description: r.achievement.description,
+    icon: r.achievement.icon,
+    tier: r.achievement.tier,
+    unlockedAt: r.unlocked_at.toISOString(),
   }));
 }
 
@@ -1006,35 +1025,8 @@ export async function getAchievements(userId: string): Promise<AchievementRow[]>
  * code path that lets the frontend grant an achievement.
  */
 export async function evaluateAchievements(userId: string): Promise<AchievementRow[]> {
-  const metrics = await queryOne<{
-    problems: number;
-    streak: number;
-    repos: number;
-    platforms: number;
-    projects: number;
-  }>(
-    `select
-       coalesce((select total_solved from public.profiles where user_id = $1), 0) as problems,
-       coalesce((select longest_streak from public.profiles where user_id = $1), 0) as streak,
-       coalesce((select max(public_repos) from public.coding_stats
-                  where user_id = $1 and platform = 'github'), 0) as repos,
-       coalesce((select count(*) from public.platform_accounts
-                  where user_id = $1 and connection_status = 'connected'), 0) as platforms,
-       coalesce((select count(*) from public.projects where user_id = $1), 0) as projects`,
-    [userId]
-  );
-  if (!metrics) return [];
-
-  const catalogue = await query<{
-    id: string;
-    code: string;
-    title: string;
-    description: string;
-    icon: string;
-    tier: string;
-    metric: string;
-    threshold: number;
-  }>(`select * from public.achievements`);
+  const metrics = await getAchievementMetrics(userId);
+  const catalogue = await prisma.achievement.findMany();
 
   const valueFor: Record<string, number> = {
     problems: metrics.problems,
@@ -1042,6 +1034,8 @@ export async function evaluateAchievements(userId: string): Promise<AchievementR
     repos: metrics.repos,
     platforms: metrics.platforms,
     projects: metrics.projects,
+    active_days: metrics.activeDays,
+    github: metrics.githubConnected ? 1 : 0,
   };
 
   const newlyUnlocked: AchievementRow[] = [];
@@ -1050,14 +1044,17 @@ export async function evaluateAchievements(userId: string): Promise<AchievementR
     const actual = valueFor[award.metric] ?? 0;
     if (actual < award.threshold) continue;
 
-    const inserted = await query<{ unlocked_at: string }>(
-      `insert into public.user_achievements (user_id, achievement_id)
-       values ($1, $2)
-       on conflict (user_id, achievement_id) do nothing
-       returning unlocked_at`,
-      [userId, award.id]
-    );
-    if (inserted.length === 0) continue; // already had it
+    let unlockedAt: Date;
+    try {
+      const inserted = await prisma.userAchievement.create({
+        data: { user_id: userId, achievement_id: award.id },
+      });
+      unlockedAt = inserted.unlocked_at;
+    } catch (error) {
+      // Already unlocked — `on conflict do nothing`.
+      if (isUniqueViolation(error)) continue;
+      throw error;
+    }
 
     newlyUnlocked.push({
       code: award.code,
@@ -1065,7 +1062,7 @@ export async function evaluateAchievements(userId: string): Promise<AchievementR
       description: award.description,
       icon: award.icon,
       tier: award.tier,
-      unlockedAt: inserted[0].unlocked_at,
+      unlockedAt: unlockedAt.toISOString(),
     });
 
     await recordActivityEvent({
@@ -1091,29 +1088,19 @@ export async function getNotifications(
   userId: string,
   limit = 12
 ): Promise<NotificationRow[]> {
-  const rows = await query<{
-    id: string;
-    kind: string;
-    title: string;
-    body: string;
-    href: string | null;
-    read_at: string | null;
-    created_at: string;
-  }>(
-    `select * from public.notifications
-      where user_id = $1
-      order by created_at desc
-      limit $2`,
-    [userId, limit]
-  );
+  const rows = await prisma.notification.findMany({
+    where: { user_id: userId },
+    orderBy: { created_at: "desc" },
+    take: limit,
+  });
   return rows.map((r) => ({
     id: r.id,
     kind: r.kind,
     title: r.title,
     body: r.body,
     href: r.href,
-    readAt: r.read_at,
-    createdAt: r.created_at,
+    readAt: toIso(r.read_at),
+    createdAt: r.created_at.toISOString(),
   }));
 }
 
@@ -1124,30 +1111,29 @@ export async function createNotification(input: {
   body?: string;
   href?: string | null;
 }): Promise<void> {
-  await query(
-    `insert into public.notifications (user_id, kind, title, body, href)
-     values ($1,$2,$3,$4,$5)`,
-    [input.userId, input.kind, input.title, input.body ?? "", input.href ?? null]
-  );
+  await prisma.notification.create({
+    data: {
+      user_id: input.userId,
+      kind: input.kind,
+      title: input.title,
+      body: input.body ?? "",
+      href: input.href ?? null,
+    },
+  });
 }
 
 export async function markNotificationsRead(
   userId: string,
   ids?: string[]
 ): Promise<void> {
-  if (ids && ids.length > 0) {
-    await query(
-      `update public.notifications set read_at = now()
-        where user_id = $1 and id = any($2::uuid[])`,
-      [userId, ids]
-    );
-    return;
-  }
-  await query(
-    `update public.notifications set read_at = now()
-      where user_id = $1 and read_at is null`,
-    [userId]
-  );
+  await prisma.notification.updateMany({
+    where: {
+      user_id: userId,
+      read_at: null,
+      ...(ids && ids.length > 0 ? { id: { in: ids } } : {}),
+    },
+    data: { read_at: new Date() },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1158,50 +1144,54 @@ export async function enqueueSyncJob(
   userId: string,
   platform: PlatformKey
 ): Promise<string> {
-  const rows = await query<{ id: string }>(
-    `insert into public.sync_jobs (user_id, platform, status)
-     values ($1, $2, 'queued') returning id`,
-    [userId, platform]
-  );
-  return rows[0].id;
+  const row = await prisma.syncJob.create({
+    data: { user_id: userId, platform, status: "queued" },
+    select: { id: true },
+  });
+  return row.id;
 }
 
 export async function getSyncJobs(userId: string, limit = 20) {
-  const rows = await query<{
-    platform: PlatformKey;
-    status: string;
-    error: string | null;
-    queued_at: string;
-  }>(
-    `select platform, status, error, queued_at
-       from public.sync_jobs
-      where user_id = $1
-      order by queued_at desc
-      limit $2`,
-    [userId, limit]
-  );
+  const rows = await prisma.syncJob.findMany({
+    where: { user_id: userId },
+    orderBy: { queued_at: "desc" },
+    take: limit,
+    select: { platform: true, status: true, error: true, queued_at: true },
+  });
   return rows.map((r) => ({
-    platform: r.platform,
+    platform: r.platform as PlatformKey,
     status: r.status,
     error: r.error,
-    queuedAt: r.queued_at,
+    queuedAt: r.queued_at.toISOString(),
   }));
 }
 
+/**
+ * Claim the oldest queued job.
+ *
+ * The guarded `updateMany` (status must still be 'queued') is the claim: two
+ * workers racing for the same row cannot both win, which is what Postgres'
+ * `for update skip locked` provided.
+ */
 export async function claimNextSyncJob(userId: string) {
-  return queryOne<{ id: string; platform: PlatformKey }>(
-    `update public.sync_jobs
-        set status = 'running', started_at = now(), attempt = attempt + 1
-      where id = (
-        select id from public.sync_jobs
-         where user_id = $1 and status = 'queued'
-         order by queued_at
-         limit 1
-         for update skip locked
-      )
-      returning id, platform`,
-    [userId]
-  );
+  const next = await prisma.syncJob.findFirst({
+    where: { user_id: userId, status: "queued" },
+    orderBy: { queued_at: "asc" },
+    select: { id: true, platform: true },
+  });
+  if (!next) return null;
+
+  const claimed = await prisma.syncJob.updateMany({
+    where: { id: next.id, status: "queued" },
+    data: {
+      status: "running",
+      started_at: new Date(),
+      attempt: { increment: 1 },
+    },
+  });
+  if (claimed.count === 0) return null;
+
+  return { id: next.id, platform: next.platform as PlatformKey };
 }
 
 export async function finishSyncJob(
@@ -1210,23 +1200,20 @@ export async function finishSyncJob(
   error?: string | null,
   durationMs?: number
 ): Promise<void> {
-  await query(
-    `update public.sync_jobs
-        set status = $2, error = $3, finished_at = now()
-      where id = $1`,
-    [jobId, status, error ?? null]
-  );
-  const row = await queryOne<{ user_id: string; platform: PlatformKey }>(
-    `select user_id, platform from public.sync_jobs where id = $1`,
-    [jobId]
-  );
-  if (row) {
-    await query(
-      `insert into public.sync_logs (user_id, platform, status, message, duration_ms)
-       values ($1,$2,$3,$4,$5)`,
-      [row.user_id, row.platform, status, error ?? null, durationMs ?? null]
-    );
-  }
+  const row = await prisma.syncJob.update({
+    where: { id: jobId },
+    data: { status, error: error ?? null, finished_at: new Date() },
+    select: { user_id: true, platform: true },
+  });
+  await prisma.syncLog.create({
+    data: {
+      user_id: row.user_id,
+      platform: row.platform,
+      status,
+      message: error ?? null,
+      duration_ms: durationMs ?? null,
+    },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1258,42 +1245,42 @@ export async function getTrackerQuestions(
   const status = options.status?.trim() ?? "";
   const limit = Math.min(Math.max(options.limit ?? 100, 1), 300);
 
-  const rows = await query<{
-    id: string;
-    slug: string;
-    title: string;
-    difficulty: string;
-    topic: string | null;
-    url: string | null;
-    status: string | null;
-    note: string | null;
-    solved_at: string | null;
-    updated_at: string | null;
-  }>(
-    `select q.id, q.slug, q.title, q.difficulty, q.topic, q.url,
-            uq.status, uq.note, uq.solved_at, uq.updated_at
-       from public.questions q
-       left join public.user_questions uq
-              on uq.question_id = q.id and uq.user_id = $1
-      where ($2 = '' or q.title ilike '%' || $2 || '%' or coalesce(q.topic,'') ilike '%' || $2 || '%')
-        and ($3 = '' or coalesce(uq.status, 'todo') = $3)
-      order by coalesce(uq.updated_at, q.created_at) desc
-      limit $4`,
-    [userId, search, status, limit]
-  );
+  const rows = await prisma.question.findMany({
+    where: search
+      ? {
+          OR: [
+            { title: { contains: search } },
+            { topic: { contains: search } },
+          ],
+        }
+      : undefined,
+    include: {
+      user_questions: { where: { user_id: userId }, take: 1 },
+    },
+  });
 
-  return rows.map((r) => ({
-    id: r.id,
-    slug: r.slug,
-    title: r.title,
-    difficulty: r.difficulty,
-    topic: r.topic,
-    url: r.url,
-    status: (r.status as TrackerQuestionRow["status"]) ?? "todo",
-    note: r.note,
-    solvedAt: r.solved_at,
-    updatedAt: r.updated_at,
-  }));
+  return rows
+    .map((row) => {
+      const mine = row.user_questions[0];
+      return {
+        id: row.id,
+        slug: row.slug,
+        title: row.title,
+        difficulty: row.difficulty,
+        topic: row.topic,
+        url: row.url,
+        status: (mine?.status as TrackerQuestionRow["status"]) ?? "todo",
+        note: mine?.note ?? null,
+        solvedAt: toIso(mine?.solved_at),
+        updatedAt: toIso(mine?.updated_at),
+        // Ordering key: the old SQL ordered by coalesce(uq.updated_at, q.created_at).
+        _sortKey: (mine?.updated_at ?? row.created_at).getTime(),
+      };
+    })
+    .filter((row) => (status ? row.status === status : true))
+    .sort((a, b) => b._sortKey - a._sortKey)
+    .slice(0, limit)
+    .map(({ _sortKey: _ignored, ...row }) => row);
 }
 
 /** Insert a question into the shared catalogue (idempotent on slug). */
@@ -1304,15 +1291,19 @@ export async function upsertQuestion(input: {
   topic?: string | null;
   url?: string | null;
 }): Promise<string> {
-  const created = await queryOne<{ id: string }>(
-    `insert into public.questions (slug, title, difficulty, topic, url)
-     values ($1,$2,$3,$4,$5)
-     on conflict (slug) do update set title = excluded.title
-     returning id`,
-    [input.slug, input.title, input.difficulty, input.topic ?? null, input.url ?? null]
-  );
-  if (!created) throw new Error("Could not create that question.");
-  return created.id;
+  const row = await prisma.question.upsert({
+    where: { slug: input.slug },
+    create: {
+      slug: input.slug,
+      title: input.title,
+      difficulty: input.difficulty,
+      topic: input.topic ?? null,
+      url: input.url ?? null,
+    },
+    update: { title: input.title },
+    select: { id: true },
+  });
+  return row.id;
 }
 
 /** Set the caller's status for a question. */
@@ -1322,60 +1313,28 @@ export async function setQuestionStatus(
   status: "todo" | "solved" | "review",
   note?: string | null
 ): Promise<void> {
-  await query(
-    `insert into public.user_questions (user_id, question_id, status, note, solved_at, updated_at)
-     values ($1,$2,$3,$4, case when $3 = 'solved' then now() else null end, now())
-     on conflict (user_id, question_id) do update
-       set status = excluded.status,
-           note = coalesce(excluded.note, public.user_questions.note),
-           solved_at = case
-             when excluded.status = 'solved'
-               then coalesce(public.user_questions.solved_at, now())
-             else null
-           end,
-           updated_at = now()`,
-    [userId, questionId, status, note ?? null]
-  );
-}
+  const existing = await prisma.userQuestion.findUnique({
+    where: { user_id_question_id: { user_id: userId, question_id: questionId } },
+  });
 
-/* ------------------------------------------------------------------ */
-/* Coding sheets                                                       */
-/* ------------------------------------------------------------------ */
+  // Solved date is set the first time the question is marked solved and
+  // cleared again if the user moves it out of solved — same rule as before.
+  const solvedAt =
+    status === "solved" ? (existing?.solved_at ?? new Date()) : null;
+  // `coalesce(excluded.note, existing.note)` — a blank note never erases one.
+  const resolvedNote = note ?? existing?.note ?? null;
 
-export type CodingSheetRow = {
-  id: string;
-  slug: string;
-  title: string;
-  description: string;
-  total: number;
-  solved: number;
-};
-
-/**
- * Sheets are grouped from the shared catalogue by topic, so their progress is
- * derived from the caller's own tracker rows rather than invented.
- */
-export async function getCodingSheets(userId: string): Promise<CodingSheetRow[]> {
-  const rows = await query<{ topic: string; total: string; solved: string }>(
-    `select coalesce(q.topic, 'General') as topic,
-            count(*)::text as total,
-            count(*) filter (where uq.status = 'solved')::text as solved
-       from public.questions q
-       left join public.user_questions uq
-              on uq.question_id = q.id and uq.user_id = $1
-      group by coalesce(q.topic, 'General')
-      order by count(*) desc`,
-    [userId]
-  );
-
-  return rows.map((r) => ({
-    id: r.topic,
-    slug: r.topic.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
-    title: r.topic + " Sheet",
-    description: "All " + r.topic.toLowerCase() + " questions tracked in Devora.",
-    total: Number(r.total),
-    solved: Number(r.solved),
-  }));
+  await prisma.userQuestion.upsert({
+    where: { user_id_question_id: { user_id: userId, question_id: questionId } },
+    create: {
+      user_id: userId,
+      question_id: questionId,
+      status,
+      note: resolvedNote,
+      solved_at: solvedAt,
+    },
+    update: { status, note: resolvedNote, solved_at: solvedAt },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1406,36 +1365,42 @@ export async function getLeaderboard(
   const search = options.search?.trim() ?? "";
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
 
-  const rows = await query<{
-    user_id: string;
-    display_username: string | null;
-    display_name: string;
-    avatar_url: string | null;
-    total_solved: number;
-    current_streak: number;
-  }>(
-    `select p.user_id, p.display_username, p.display_name, p.avatar_url,
-            p.total_solved, p.current_streak
-       from public.profiles p
-      where p.onboarding_completed = true
-        and p.display_username is not null
-        and ($2 = '' or p.display_username ilike '%' || $2 || '%'
-                     or p.display_name ilike '%' || $2 || '%')
-        and coalesce((p.visibility->>'platforms')::boolean, true) = true
-      order by p.total_solved desc, p.current_streak desc, p.created_at asc
-      limit $3`,
-    [userId, search, limit]
-  );
+  const rows = await prisma.profile.findMany({
+    where: {
+      onboarding_completed: true,
+      display_username: { not: null },
+      ...(search
+        ? {
+            OR: [
+              { display_username: { contains: search } },
+              { display_name: { contains: search } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: [
+      { total_solved: "desc" },
+      { current_streak: "desc" },
+      { created_at: "asc" },
+    ],
+    take: limit,
+  });
 
-  return rows.map((r, i) => ({
-    rank: i + 1,
-    username: r.display_username ?? "",
-    displayName: r.display_name,
-    avatarUrl: r.avatar_url,
-    totalSolved: Number(r.total_solved ?? 0),
-    currentStreak: Number(r.current_streak ?? 0),
-    isCurrentUser: r.user_id === userId,
-  }));
+  return rows
+    .filter((row) => {
+      const visibility = row.visibility as Visibility | null;
+      return (visibility?.platforms ?? DEFAULT_VISIBILITY.platforms) === true;
+    })
+    .slice(0, limit)
+    .map((r, i) => ({
+      rank: i + 1,
+      username: r.display_username ?? "",
+      displayName: r.display_name,
+      avatarUrl: r.avatar_url,
+      totalSolved: Number(r.total_solved ?? 0),
+      currentStreak: Number(r.current_streak ?? 0),
+      isCurrentUser: r.user_id === userId,
+    }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1462,21 +1427,31 @@ export async function setPlatformLink(input: {
   profileUrl: string;
   authType: "oauth" | "public";
 }): Promise<void> {
-  await query(
-    `insert into public.platform_accounts
-       (user_id, platform, username, profile_url, auth_type, connection_status, sync_status)
-     values ($1, $2, $3, $4, $5, 'linked', 'idle')
-     on conflict (user_id, platform) do update set
-       username = excluded.username,
-       profile_url = excluded.profile_url,
-       -- keep a genuine connection; only ever mark a brand-new row as linked
-       connection_status = case
-         when public.platform_accounts.connection_status = 'connected' then 'connected'
-         else 'linked'
-       end,
-       updated_at = now()`,
-    [input.userId, input.platform, input.username, input.profileUrl, input.authType]
-  );
+  const where = { user_id_platform: { user_id: input.userId, platform: input.platform } };
+  const existing = await prisma.platformAccount.findUnique({
+    where,
+    select: { connection_status: true },
+  });
+
+  const status = existing?.connection_status === "connected" ? "connected" : "linked";
+
+  await prisma.platformAccount.upsert({
+    where,
+    create: {
+      user_id: input.userId,
+      platform: input.platform,
+      username: input.username,
+      profile_url: input.profileUrl,
+      auth_type: input.authType,
+      connection_status: "linked",
+      sync_status: "idle",
+    },
+    update: {
+      username: input.username,
+      profile_url: input.profileUrl,
+      connection_status: status,
+    },
+  });
 }
 
 /**
@@ -1489,31 +1464,22 @@ export async function clearPlatformLink(
   userId: string,
   platform: PlatformKey
 ): Promise<void> {
-  await query(
-    `delete from public.platform_accounts
-      where user_id = $1 and platform = $2 and connection_status = 'linked'`,
-    [userId, platform]
-  );
+  await prisma.platformAccount.deleteMany({
+    where: { user_id: userId, platform, connection_status: "linked" },
+  });
 }
 
 /** Every platform row regardless of status, for the /profile/create draft. */
 export async function getPlatformLinks(userId: string): Promise<
   { platform: PlatformKey; username: string; profileUrl: string | null; connectionStatus: string }[]
 > {
-  const rows = await query<{
-    platform: PlatformKey;
-    username: string;
-    profile_url: string | null;
-    connection_status: string;
-  }>(
-    `select platform, username, profile_url, connection_status
-       from public.platform_accounts
-      where user_id = $1
-      order by connected_at`,
-    [userId]
-  );
+  const rows = await prisma.platformAccount.findMany({
+    where: { user_id: userId },
+    orderBy: { connected_at: "asc" },
+    select: { platform: true, username: true, profile_url: true, connection_status: true },
+  });
   return rows.map((r) => ({
-    platform: r.platform,
+    platform: r.platform as PlatformKey,
     username: r.username,
     profileUrl: r.profile_url,
     connectionStatus: r.connection_status,
@@ -1524,8 +1490,8 @@ export async function getPlatformLinks(userId: string): Promise<
  * Mark the profile as complete.
  *
  * This is the ONLY place onboarding_completed is set to true, and it re-checks
- * the genuinely required fields in SQL so a malformed request cannot flip the
- * flag on its own. A profile is complete ONLY when it has:
+ * the genuinely required fields before flipping the flag so a malformed request
+ * cannot complete onboarding on its own. A profile is complete ONLY when it has:
  *
  *   - a display name
  *   - a claimed (unique) username
@@ -1535,21 +1501,523 @@ export async function getPlatformLinks(userId: string): Promise<
  * Photo and coding-platform connections are deliberately NOT required.
  */
 export async function markProfileComplete(userId: string): Promise<boolean> {
-  const row = await queryOne<{ onboarding_completed: boolean }>(
-    `update public.profiles as p
-        set onboarding_completed = true,
-            onboarding_completed_at = coalesce(p.onboarding_completed_at, now()),
-            onboarding_step = 5,
-            updated_at = now()
-      where p.user_id = $1
-        and coalesce(p.display_name, '') <> ''
-        and coalesce(p.display_username, '') <> ''
-        and coalesce(p.college, '') <> ''
-        and exists (
-          select 1 from public.user_skills us where us.user_id = p.user_id
-        )
-      returning p.onboarding_completed`,
-    [userId]
+  const profile = await getProfile(userId);
+  if (!profile) return false;
+
+  if (
+    !profile.display_name?.trim() ||
+    !profile.display_username?.trim() ||
+    !profile.college?.trim()
+  ) {
+    return false;
+  }
+
+  const skills = await prisma.userSkill.count({ where: { user_id: userId } });
+  if (skills === 0) return false;
+
+  const updated = await prisma.profile.update({
+    where: { user_id: userId },
+    data: {
+      onboarding_completed: true,
+      // `coalesce(onboarding_completed_at, now())`: the first completion time is
+      // kept, so re-running onboarding never moves "member since".
+      onboarding_completed_at: profile.onboardingCompletedAt ?? new Date(),
+      onboarding_step: 5,
+    },
+    select: { onboarding_completed: true },
+  });
+  return updated.onboarding_completed === true;
+}
+
+/* ==================================================================== */
+/* Dashboard analytics                                                  */
+/*                                                                      */
+/* Every number here is derived from stored rows. The daily series is    */
+/* the single source of truth, so streaks, heatmap, monthly and yearly   */
+/* figures can never disagree with one another.                          */
+/* ==================================================================== */
+
+/**
+ * How far back the daily series reaches. This is a payload bound, not a
+ * business rule: it keeps one dashboard response small while still covering
+ * multi-year histories.
+ */
+const DAILY_HISTORY_DAYS = 800;
+
+/** The difficulty split an adapter recorded for one day. */
+function difficultyTotal(value: unknown): number {
+  if (typeof value !== "object" || value === null) return 0;
+  const split = value as Record<string, unknown>;
+  const pick = (key: string) => {
+    const raw = split[key];
+    const n = typeof raw === "number" ? raw : Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  };
+  return pick("easy") + pick("medium") + pick("hard");
+}
+
+/**
+ * The authoritative daily activity series, aggregated across all platforms.
+ *
+ * `activities` is the count the heatmap is shaded from; `problems` is the sum
+ * of the difficulty split the adapters recorded, so the problems graph reports
+ * solved problems rather than submissions. `byPlatform` preserves the split so
+ * platform-specific figures stay separate from the totals.
+ */
+export async function getDailyActivity(userId: string): Promise<DailyActivity[]> {
+  const rows = await prisma.activityDaily.findMany({
+    where: {
+      user_id: userId,
+      count: { gt: 0 },
+      day: { gte: daysAgo(DAILY_HISTORY_DAYS) },
+    },
+    select: { day: true, platform: true, count: true, difficulty: true },
+  });
+
+  const byDay = new Map<string, DailyActivity>();
+  for (const row of rows) {
+    const key = dayKey(row.day);
+    const entry =
+      byDay.get(key) ??
+      ({ day: key, activities: 0, problems: 0, byPlatform: {} } as DailyActivity);
+    const activities = Number(row.count ?? 0);
+    entry.activities += activities;
+    entry.problems += difficultyTotal(row.difficulty);
+    const platform = row.platform as PlatformKey;
+    entry.byPlatform[platform] = (entry.byPlatform[platform] ?? 0) + activities;
+    byDay.set(key, entry);
+  }
+
+  return [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
+}
+
+/* ------------------------------ streak block ----------------------------- */
+
+export function buildStreakStats(daily: DailyActivity[], today = new Date()): StreakStats {
+  const { current, longest } = computeStreaks(daily, today);
+  const totals = sumSeries(daily);
+  const yearPrefix = String(today.getFullYear());
+
+  return {
+    current,
+    longest,
+    activeDays: daily.filter((d) => d.activities > 0).length,
+    activeDaysThisYear: daily.filter(
+      (d) => d.activities > 0 && d.day.startsWith(yearPrefix)
+    ).length,
+    totalActivities: totals.activities,
+    totalProblems: totals.problems,
+    isEmpty: totals.activities === 0,
+  };
+}
+
+/* ---------------------------- platform section --------------------------- */
+
+/** Per-platform solved totals. Only platforms that really report a count. */
+export async function getPlatformComparison(
+  userId: string
+): Promise<PlatformComparisonRow[]> {
+  const rows = await prisma.codingStat.findMany({
+    where: { user_id: userId, solved_total: { gt: 0 } },
+    orderBy: [{ solved_total: "desc" }, { platform: "asc" }],
+    select: { platform: true, solved_total: true },
+  });
+
+  return rows.map((row) => ({
+    platform: row.platform as PlatformKey,
+    label: PLATFORM_BY_KEY[row.platform as PlatformKey]?.label ?? row.platform,
+    solved: Number(row.solved_total ?? 0),
+  }));
+}
+
+/* ------------------------------ github block ----------------------------- */
+
+/**
+ * GitHub summary built strictly from what the adapter actually stored.
+ *
+ * Commits / pull requests / issues are left null because the adapter has no
+ * honest source for them — the UI renders "—" instead of a guess.
+ */
+export async function getGitHubOverview(userId: string): Promise<GitHubOverview | null> {
+  const row = await prisma.platformAccount.findFirst({
+    where: {
+      user_id: userId,
+      platform: "github",
+      connection_status: { not: "disconnected" },
+    },
+    include: { coding_stats: { take: 1 } },
+  });
+  if (!row) return null;
+
+  const stats = row.coding_stats[0];
+  const raw =
+    typeof stats?.raw === "object" && stats.raw !== null
+      ? (stats.raw as Record<string, unknown>)
+      : {};
+  const languages: GitHubLanguage[] = Array.isArray(raw.languages)
+    ? (raw.languages as GitHubLanguage[]).filter(
+        (l) => l && typeof l.name === "string" && typeof l.count === "number"
+      )
+    : [];
+
+  return {
+    username: row.username,
+    profileUrl: row.profile_url,
+    repositories: stats?.public_repos ?? null,
+    followers: stats?.followers ?? null,
+    following: typeof raw.following === "number" ? raw.following : null,
+    contributions: stats?.contributions ?? null,
+    commits: null,
+    pullRequests: null,
+    issues: null,
+    stars: typeof raw.stars === "number" ? raw.stars : null,
+    languages,
+    lastSyncedAt: toIso(row.last_synced_at),
+    syncStatus: row.sync_status as SyncStatus,
+  };
+}
+
+/* --------------------------- monthly + yearly ---------------------------- */
+
+export function buildMonthlyProgress(
+  daily: DailyActivity[],
+  today = new Date()
+): MonthlyProgress {
+  const months = aggregateMonths(daily);
+  const currentKey = monthKeyOf(today);
+  const previousDate = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  const previousKey = monthKeyOf(previousDate);
+
+  const current = months.find((m) => m.monthKey === currentKey) ?? null;
+  const previous = months.find((m) => m.monthKey === previousKey) ?? null;
+  const { current: currentStreak } = computeStreaks(daily, today);
+
+  // Only compare when the previous month genuinely has problems to compare to.
+  const problemsChangePercent =
+    previous && previous.problems > 0
+      ? Math.round((((current?.problems ?? 0) - previous.problems) / previous.problems) * 100)
+      : null;
+
+  return {
+    label: `${monthLabel(currentKey)} ${currentKey.slice(0, 4)}`,
+    monthKey: currentKey,
+    problemsSolved: current?.problems ?? 0,
+    activeDays: current?.activeDays ?? 0,
+    activities: current?.activities ?? 0,
+    currentStreak,
+    previous: previous
+      ? {
+          label: previous.label,
+          problemsSolved: previous.problems,
+          activeDays: previous.activeDays,
+          activities: previous.activities,
+        }
+      : null,
+    problemsChangePercent,
+    hasData: Boolean(current) || daily.length > 0,
+  };
+}
+
+type MonthAggregateLike = { label: string; activities: number };
+
+export function buildYearlyOverview(
+  daily: DailyActivity[],
+  topics: TopicProgressRow[],
+  comparison: PlatformComparisonRow[],
+  today = new Date()
+): YearlyOverview {
+  const year = today.getFullYear();
+  const prefix = String(year);
+  const yearDaily = daily.filter((d) => d.day.startsWith(prefix));
+  const totals = sumSeries(yearDaily);
+  const { longest } = computeStreaks(yearDaily, today);
+
+  const months = aggregateMonths(yearDaily);
+  const busiest = months.reduce<MonthAggregateLike | null>(
+    (best, m) => (!best || m.activities > best.activities ? m : best),
+    null
   );
-  return row?.onboarding_completed === true;
+
+  const mostSolved = topics
+    .filter((t) => t.solved > 0)
+    .reduce<TopicProgressRow | null>((best, t) => (!best || t.solved > best.solved ? t : best), null);
+
+  const topPlatform = comparison[0] ?? null;
+
+  return {
+    year,
+    problemsSolved: totals.problems,
+    activeDays: yearDaily.filter((d) => d.activities > 0).length,
+    longestStreak: longest,
+    activities: totals.activities,
+    mostActiveMonth: busiest
+      ? { label: busiest.label, activities: busiest.activities }
+      : null,
+    mostSolvedTopic: mostSolved ? { topic: mostSolved.topic, solved: mostSolved.solved } : null,
+    mostUsedPlatform: topPlatform
+      ? {
+          platform: topPlatform.platform,
+          label: topPlatform.label,
+          solved: topPlatform.solved,
+        }
+      : null,
+    hasData: yearDaily.length > 0,
+  };
+}
+
+/* ------------------------------ achievements ----------------------------- */
+
+/**
+ * The metric values every achievement threshold is checked against.
+ * Computed from stored rows only — there is no client write path to these.
+ */
+export async function getAchievementMetrics(
+  userId: string,
+  daily?: DailyActivity[]
+): Promise<{
+  problems: number;
+  streak: number;
+  repos: number;
+  platforms: number;
+  projects: number;
+  activeDays: number;
+  githubConnected: boolean;
+}> {
+  const [profile, repoRows, platforms, projects, activeDayRows, githubRows] =
+    await Promise.all([
+      prisma.profile.findUnique({
+        where: { user_id: userId },
+        select: { total_solved: true, longest_streak: true },
+      }),
+      prisma.codingStat.findMany({
+        where: { user_id: userId, platform: "github" },
+        select: { public_repos: true },
+      }),
+      prisma.platformAccount.count({
+        where: { user_id: userId, connection_status: "connected" },
+      }),
+      prisma.project.count({ where: { user_id: userId } }),
+      prisma.activityDaily.groupBy({
+        by: ["day"],
+        where: { user_id: userId, count: { gt: 0 } },
+      }),
+      prisma.platformAccount.count({
+        where: { user_id: userId, platform: "github", connection_status: "connected" },
+      }),
+    ]);
+
+  const repos = repoRows
+    .map((r) => r.public_repos)
+    .filter((v): v is number => v !== null);
+
+  const computedStreak = daily ? computeStreaks(daily).longest : 0;
+
+  return {
+    problems: Number(profile?.total_solved ?? 0),
+    // Prefer the streak we can prove from daily activity; fall back to the
+    // platform-reported figure when there is no daily history yet.
+    streak: Math.max(Number(profile?.longest_streak ?? 0), computedStreak),
+    repos: repos.length > 0 ? Math.max(...repos) : 0,
+    platforms,
+    projects,
+    activeDays: activeDayRows.length,
+    githubConnected: githubRows > 0,
+  };
+}
+
+/**
+ * Unlocked achievements plus the locked ones with real progress, so the UI can
+ * show "43 / 100" without inventing anything.
+ */
+export async function getAchievementsSummary(
+  userId: string,
+  daily?: DailyActivity[]
+): Promise<AchievementSummary> {
+  const [unlocked, catalogue, metrics] = await Promise.all([
+    getAchievements(userId),
+    prisma.achievement.findMany({ orderBy: [{ threshold: "asc" }, { code: "asc" }] }),
+    getAchievementMetrics(userId, daily),
+  ]);
+
+  const valueFor: Record<string, number> = {
+    problems: metrics.problems,
+    streak: metrics.streak,
+    repos: metrics.repos,
+    platforms: metrics.platforms,
+    projects: metrics.projects,
+    active_days: metrics.activeDays,
+    github: metrics.githubConnected ? 1 : 0,
+  };
+
+  const unlockedCodes = new Set(unlocked.map((a) => a.code));
+
+  const locked: LockedAchievement[] = catalogue
+    .filter((a) => !unlockedCodes.has(a.code))
+    .map((a) => {
+      const actual = valueFor[a.metric] ?? 0;
+      return {
+        code: a.code,
+        title: a.title,
+        description: a.description,
+        icon: a.icon,
+        tier: a.tier,
+        metric: a.metric,
+        threshold: a.threshold,
+        progress: Math.max(0, Math.min(actual, a.threshold)),
+      };
+    });
+
+  return {
+    unlocked,
+    locked,
+    unlockedCount: unlocked.length,
+    totalCount: catalogue.length,
+  };
+}
+
+/* ------------------------------ leaderboard ------------------------------ */
+
+/**
+ * Monthly leaderboard.
+ *
+ * Ranked by this calendar month's real activity, so the ranking resets by
+ * itself on the 1st — no scheduled job. Only users with genuine activity this
+ * month are listed, and only profiles that are public and hold a username.
+ */
+export async function getMonthlyLeaderboard(
+  userId: string,
+  limit = 50
+): Promise<{ rows: MonthlyLeaderboardRow[]; available: boolean }> {
+  const bounded = Math.min(Math.max(limit, 1), 100);
+  try {
+    const today = new Date();
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+    const nextMonthStart = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+
+    const rows = await prisma.activityDaily.findMany({
+      where: { day: { gte: monthStart, lt: nextMonthStart } },
+      select: { user_id: true, day: true, count: true, difficulty: true },
+    });
+
+    type MonthTotal = {
+      user_id: string;
+      problems: number;
+      activities: number;
+      days: Set<string>;
+    };
+    const byUser = new Map<string, MonthTotal>();
+    for (const row of rows) {
+      const entry =
+        byUser.get(row.user_id) ?? {
+          user_id: row.user_id,
+          problems: 0,
+          activities: 0,
+          days: new Set<string>(),
+        };
+      entry.problems += difficultyTotal(row.difficulty);
+      entry.activities += row.count;
+      if (row.count > 0) entry.days.add(dayKey(row.day));
+      byUser.set(row.user_id, entry);
+    }
+    if (byUser.size === 0) return { available: true, rows: [] };
+
+    const profiles = await prisma.profile.findMany({
+      where: {
+        user_id: { in: [...byUser.keys()] },
+        onboarding_completed: true,
+        display_username: { not: null },
+      },
+    });
+
+    const ranked = profiles
+      .filter((p) => {
+        const visibility = p.visibility as Visibility | null;
+        return (visibility?.platforms ?? DEFAULT_VISIBILITY.platforms) === true;
+      })
+      .map((p) => {
+        const totals = byUser.get(p.user_id)!;
+        return {
+          profile: p,
+          problems: totals.problems,
+          activeDays: totals.days.size,
+          score: totals.problems * 10 + totals.activities,
+        };
+      })
+      .sort((a, b) =>
+        b.score - a.score ||
+        b.problems - a.problems ||
+        a.profile.created_at.getTime() - b.profile.created_at.getTime()
+      )
+      .slice(0, bounded);
+
+    return {
+      available: true,
+      rows: ranked.map((entry, i) => ({
+        rank: i + 1,
+        username: entry.profile.display_username ?? "",
+        displayName: entry.profile.display_name,
+        avatarUrl: entry.profile.avatar_url,
+        problemsSolved: entry.problems,
+        activeDays: entry.activeDays,
+        score: entry.score,
+        isCurrentUser: entry.profile.user_id === userId,
+      })),
+    };
+  } catch (error) {
+    // A leaderboard problem must never take the whole dashboard down.
+    console.error("[devora/dashboard] leaderboard unavailable", error);
+    return { available: false, rows: [] };
+  }
+}
+
+/* --------------------------- one-call analytics -------------------------- */
+
+export type DashboardAnalytics = {
+  daily: DailyActivity[];
+  streak: StreakStats;
+  platformComparison: PlatformComparisonRow[];
+  github: GitHubOverview | null;
+  monthly: MonthlyProgress;
+  yearly: YearlyOverview;
+  personalBests: PersonalBests;
+  achievementsSummary: AchievementSummary;
+  monthlyLeaderboard: MonthlyLeaderboardRow[];
+  leaderboardAvailable: boolean;
+};
+
+/**
+ * Everything the dashboard's charts and analytic sections need, in one call.
+ *
+ * The daily series is read once and every derived figure is computed from it,
+ * so the client never has to fan out to a dozen endpoints (§28).
+ */
+export async function getDashboardAnalytics(userId: string): Promise<DashboardAnalytics> {
+  const daily = await getDailyActivity(userId);
+
+  const [platformComparison, github, achievementsSummary, leaderboard, topicsExplicit, topicsDerived] =
+    await Promise.all([
+      getPlatformComparison(userId),
+      getGitHubOverview(userId),
+      getAchievementsSummary(userId, daily),
+      getMonthlyLeaderboard(userId),
+      getTopicProgress(userId),
+      deriveTopicProgressFromTracker(userId),
+    ]);
+
+  // Same rule the payload uses: tracker rows win, derived counts are the
+  // fallback — so "most solved topic" can never disagree with the topic panel.
+  const topics = topicsExplicit.length > 0 ? topicsExplicit : topicsDerived;
+
+  return {
+    daily,
+    streak: buildStreakStats(daily),
+    platformComparison,
+    github,
+    monthly: buildMonthlyProgress(daily),
+    yearly: buildYearlyOverview(daily, topics, platformComparison),
+    personalBests: computePersonalBests(daily),
+    achievementsSummary,
+    monthlyLeaderboard: leaderboard.rows,
+    leaderboardAvailable: leaderboard.available,
+  };
 }

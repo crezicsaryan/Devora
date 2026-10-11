@@ -114,8 +114,15 @@ export function PlatformsStep({
         return;
       }
 
-      await onChanged();
       setHandles((prev) => ({ ...prev, [meta.key]: "" }));
+
+      // A saved link is not a verified connection: it has nothing to sync, and
+      // the server would refuse. Report what was actually stored instead.
+      if (res.data.connectionStatus !== "connected") {
+        onNotice(res.data.message);
+        await onChanged();
+        return;
+      }
 
       // Kick off the first sync for that platform straight away.
       setBusy({ kind: "syncing", platform: meta.key });

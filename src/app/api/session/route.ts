@@ -11,7 +11,7 @@
 
 import { getProfile } from "@/lib/db/repository";
 import { errorResponse, getSessionUser, okResponse } from "@/lib/server-auth";
-import { hasDatabase } from "@/lib/db/pool";
+import { hasDatabase } from "@/lib/db/prisma";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +29,10 @@ export async function GET() {
         authenticated: true,
         onboardingCompleted: true,
         redirectTo: "/dashboard",
+        // Name comes from the verified session (OAuth metadata / email), not
+        // the database, so the greeting still works while the DB is down.
+        name: user.name,
+        avatarUrl: user.avatarUrl,
         warning: "database_unavailable",
       });
     }
@@ -38,6 +42,8 @@ export async function GET() {
 
     return okResponse({
       authenticated: true,
+      name: user.name,
+      avatarUrl: user.avatarUrl,
       onboardingCompleted,
       hasUsername: Boolean(profile?.display_username),
       onboardingStep: profile?.onboarding_step ?? 1,

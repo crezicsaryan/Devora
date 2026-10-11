@@ -11,7 +11,9 @@ import type { PlatformKey } from "@/lib/validation";
 import type { NormalizedStats } from "@/lib/db/repository";
 import {
   PlatformError,
-  platformFetch,
+  platformFetchJsonResult,
+  classifyVerifyFailure,
+  verifiedResult,
   toDayKey,
   currentStreakFromDays,
   longestStreakFromDays,
@@ -60,19 +62,38 @@ type CfSubmission = {
   };
 };
 
+/**
+ * Codeforces reports its own errors inside the body, at a NON-200 status:
+ * a missing handle is `400 {"status":"FAILED","comment":"handles: User with
+ * handle x not found"}`. Reading that body is the only way to tell "no such
+ * handle" (a valid answer about the user's input) apart from "Codeforces is
+ * broken" — so this reads it instead of discarding the response on 4xx.
+ */
 async function cfGet<T>(path: string, revalidate = 600): Promise<T> {
-  const body = await platformFetch<CfResponse<T>>(`${API}/${path}`, { revalidate });
-  if (body.status !== "OK") {
-    const comment = body.comment ?? "";
-    if (/not found|no such user/i.test(comment)) {
-      throw new PlatformError("not_found", "No Codeforces handle with that name.");
-    }
-    if (/limit|too many/i.test(comment)) {
-      throw new PlatformError("rate_limited", "Codeforces is rate limiting requests.", true);
-    }
-    throw new PlatformError("upstream_error", comment || "Codeforces returned an error.");
+  const res = await platformFetchJsonResult<CfResponse<T>>(`${API}/${path}`, {
+    revalidate,
+  });
+
+  if (res.body && res.body.status === "OK") return res.body.result;
+
+  const comment = res.body?.comment ?? "";
+  if (/not found|no such user/i.test(comment) || res.status === 404) {
+    throw new PlatformError("not_found", "No Codeforces handle with that name.");
   }
-  return body.result;
+  if (/limit|too many/i.test(comment) || res.status === 429) {
+    throw new PlatformError("rate_limited", "Codeforces is rate limiting requests.", true);
+  }
+  if (res.status >= 500) {
+    throw new PlatformError(
+      "upstream_error",
+      `Codeforces returned an unexpected response (${res.status}).`,
+      true
+    );
+  }
+  throw new PlatformError(
+    "upstream_error",
+    comment || `Codeforces returned an unexpected response (${res.status}).`
+  );
 }
 
 /**
@@ -158,17 +179,23 @@ export const codeforcesAdapter: PlatformAdapter = {
         900
       );
       const user = users[0];
-      return user
-        ? { exists: true, message: `@${user.handle}` }
-        : { exists: false, message: "No Codeforces handle with that name." };
+      if (!user) {
+        return classifyVerifyFailure(
+          new PlatformError("not_found", "No Codeforces handle with that name."),
+          { statsAvailable: true, fallbackUsername: username }
+        );
+      }
+      return verifiedResult({
+        username: user.handle,
+        profileUrl: `https://codeforces.com/profile/${user.handle}`,
+        message: user.rating ? `@${user.handle} · ${user.rank || "rated"} ${user.rating}` : `@${user.handle}`,
+        statsAvailable: true,
+      });
     } catch (error) {
-      if (error instanceof PlatformError && error.reason === "not_found") {
-        return { exists: false, message: "No Codeforces handle with that name." };
-      }
-      if (error instanceof PlatformError && error.reason === "rate_limited") {
-        return { exists: false, message: "Codeforces is rate limiting checks. Try again shortly." };
-      }
-      throw error;
+      return classifyVerifyFailure(error, {
+        statsAvailable: true,
+        fallbackUsername: username,
+      });
     }
   },
 

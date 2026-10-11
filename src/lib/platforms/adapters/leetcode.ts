@@ -12,6 +12,8 @@ import type { NormalizedStats } from "@/lib/db/repository";
 import {
   PlatformError,
   platformFetch,
+  classifyVerifyFailure,
+  verifiedResult,
   toDayKey,
   type AdapterActivity,
   type AdapterIdentity,
@@ -153,15 +155,21 @@ export const leetcodeAdapter: PlatformAdapter = {
   async verify(username: string) {
     try {
       const data = await fetchProfile(username);
-      return { exists: true, message: `@${data?.matchedUser?.username ?? username}` };
+      const handle = data?.matchedUser?.username ?? username;
+      const solved = data?.matchedUser?.submitStatsGlobal?.acSubmissionNum?.find(
+        (c) => c.difficulty.toLowerCase() === "all"
+      )?.count;
+      return verifiedResult({
+        username: handle,
+        profileUrl: `https://leetcode.com/u/${handle}/`,
+        message: solved != null ? `@${handle} · ${solved} solved` : `@${handle}`,
+        statsAvailable: true,
+      });
     } catch (error) {
-      if (error instanceof PlatformError && error.reason === "not_found") {
-        return { exists: false, message: "No LeetCode profile with that username." };
-      }
-      if (error instanceof PlatformError && error.reason === "rate_limited") {
-        return { exists: false, message: "LeetCode is rate limiting checks. Try again shortly." };
-      }
-      throw error;
+      return classifyVerifyFailure(error, {
+        statsAvailable: true,
+        fallbackUsername: username,
+      });
     }
   },
 

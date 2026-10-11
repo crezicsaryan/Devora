@@ -54,7 +54,27 @@ export async function GET(request: NextRequest) {
     });
 
     const solved = questions.filter((q) => q.status === "solved").length;
-    return okResponse({ questions, solved, total: questions.length });
+
+    // Solved split by difficulty, derived from the very rows this response
+    // returns — so the bar graph can never disagree with the list beside it.
+    const byDifficulty = { easy: 0, medium: 0, hard: 0 };
+    for (const q of questions) {
+      if (q.status !== "solved") continue;
+      const key = q.difficulty.toLowerCase();
+      if (key === "easy" || key === "medium" || key === "hard") byDifficulty[key] += 1;
+    }
+    const solvedByDifficulty = byDifficulty.easy + byDifficulty.medium + byDifficulty.hard;
+
+    return okResponse({
+      questions,
+      solved,
+      total: questions.length,
+      breakdown: {
+        ...byDifficulty,
+        total: solvedByDifficulty,
+        available: solvedByDifficulty > 0,
+      },
+    });
   } catch (error) {
     return errorResponse(error, "Could not load your questions.");
   }

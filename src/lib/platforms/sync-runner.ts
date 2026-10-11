@@ -14,6 +14,7 @@
 import "server-only";
 import { getAdapter } from "@/lib/platforms/registry";
 import { PlatformError, type AdapterRepository } from "@/lib/platforms/types";
+import { PLATFORM_BY_KEY } from "@/lib/types";
 import type { PlatformKey } from "@/lib/validation";
 import {
   claimNextSyncJob,
@@ -30,19 +31,17 @@ import {
   upsertCodingStats,
   upsertPlatformAccount,
 } from "@/lib/db/repository";
-import { query as rawQuery, queryOne } from "@/lib/db/pool";
+import { prisma } from "@/lib/db/prisma";
 
 /** Read the OAuth token for an account. Server-only; never returned to a client. */
 async function loadAccessToken(
   userId: string,
   platform: PlatformKey
 ): Promise<{ accessToken: string | null; refreshToken: string | null }> {
-  const row = await queryOne<{ access_token: string; refresh_token: string | null }>(
-    `select access_token, refresh_token
-       from public.platform_oauth_tokens
-      where user_id = $1 and platform = $2`,
-    [userId, platform]
-  );
+  const row = await prisma.platformOauthToken.findFirst({
+    where: { user_id: userId, platform },
+    select: { access_token: true, refresh_token: true },
+  });
   return {
     accessToken: row?.access_token ?? null,
     refreshToken: row?.refresh_token ?? null,
@@ -65,12 +64,36 @@ export async function runPlatformSync(
   const started = Date.now();
   const adapter = getAdapter(platform);
 
+  const meta = PLATFORM_BY_KEY[platform];
+
+  // A platform with no public statistics source has nothing to sync, and
+  // running anyway would only write a "sync failed" row the user cannot fix.
+  if (meta?.linkOnly) {
+    return {
+      platform,
+      ok: false,
+      error: `${meta.label} publishes no public statistics source, so there are no figures to sync. Your profile link is still saved.`,
+      reason: "unsupported",
+    };
+  }
+
   const account = await getPlatformAccount(userId, platform);
   if (!account || account.connection_status === "disconnected") {
     return {
       platform,
       ok: false,
       error: "Platform is not connected.",
+      reason: "not_connected",
+    };
+  }
+
+  // A saved link is not a verified integration: syncing it would claim data we
+  // never verified the account for.
+  if (account.connection_status !== "connected") {
+    return {
+      platform,
+      ok: false,
+      error: "This platform is saved as a profile link, not a verified connection. Nothing has been synced.",
       reason: "not_connected",
     };
   }
@@ -121,18 +144,18 @@ export async function runPlatformSync(
 
       // Derived streak fields are recomputed from the stored series so the
       // dashboard never depends on an adapter getting streak maths right.
-      await rawQuery(
-        `update public.coding_stats
-            set streak_current = coalesce($3, streak_current),
-                streak_longest = coalesce($4, streak_longest)
-          where user_id = $1 and platform = $2`,
-        [
-          userId,
-          platform,
-          result.activity.currentStreak,
-          result.activity.longestStreak,
-        ]
-      );
+      await prisma.codingStat.updateMany({
+        where: { user_id: userId, platform },
+        data: {
+          // coalesce(...): a null never overwrites a figure we already have.
+          ...(result.activity.currentStreak != null
+            ? { streak_current: result.activity.currentStreak }
+            : {}),
+          ...(result.activity.longestStreak != null
+            ? { streak_longest: result.activity.longestStreak }
+            : {}),
+        },
+      });
     }
 
     // GitHub repositories seed the Projects panel using real repo metadata.
@@ -159,27 +182,34 @@ export async function runPlatformSync(
           const tech = [repo.language, ...(repo.topics ?? [])].filter(
             (t): t is string => Boolean(t)
           );
-          await rawQuery(
-            `insert into public.projects
-               (user_id, name, description, tech_stack, github_url, live_url,
-                is_featured, source, external_id)
-             values ($1,$2,$3,$4,$5,$6,false,'github',$7)
-             on conflict (user_id, source, external_id) where external_id is not null
-             do update set
-               description = excluded.description,
-               tech_stack = excluded.tech_stack,
-               github_url = excluded.github_url,
-               live_url = excluded.live_url`,
-            [
-              userId,
-              repo.name,
-              repo.description ?? "",
-              tech.slice(0, 12),
-              repo.html_url,
-              repo.homepage || null,
-              String(repo.id),
-            ]
-          );
+          await prisma.project.upsert({
+            where: {
+              user_id_source_external_id: {
+                user_id: userId,
+                source: "github",
+                external_id: String(repo.id),
+              },
+            },
+            create: {
+              user_id: userId,
+              name: repo.name,
+              description: repo.description ?? "",
+              tech_stack: tech.slice(0, 12),
+              github_url: repo.html_url,
+              live_url: repo.homepage || null,
+              is_featured: false,
+              source: "github",
+              external_id: String(repo.id),
+            },
+            // A re-sync refreshes the repo metadata but never the user's own
+            // ordering/feature choices.
+            update: {
+              description: repo.description ?? "",
+              tech_stack: tech.slice(0, 12),
+              github_url: repo.html_url,
+              live_url: repo.homepage || null,
+            },
+          });
         }
       }
     }
@@ -262,19 +292,22 @@ export async function processSyncQueue(
 export async function queueAndProcessAll(
   userId: string
 ): Promise<SyncOutcome[]> {
-  const accounts = await rawQuery<{ platform: PlatformKey }>(
-    `select platform from public.platform_accounts
-      where user_id = $1 and connection_status = 'connected'`,
-    [userId]
-  );
+  const accounts = await prisma.platformAccount.findMany({
+    where: { user_id: userId, connection_status: "connected" },
+    select: { platform: true },
+  });
 
   for (const account of accounts) {
-    const pending = await queryOne<{ id: string }>(
-      `select id from public.sync_jobs
-        where user_id = $1 and platform = $2 and status in ('queued','running')`,
-      [userId, account.platform]
-    );
-    if (!pending) await enqueueSyncJob(userId, account.platform);
+    const platform = account.platform as PlatformKey;
+    const pending = await prisma.syncJob.findFirst({
+      where: {
+        user_id: userId,
+        platform,
+        status: { in: ["queued", "running"] },
+      },
+      select: { id: true },
+    });
+    if (!pending) await enqueueSyncJob(userId, platform);
   }
 
   return processSyncQueue(userId, Math.max(accounts.length, 1) + 2);

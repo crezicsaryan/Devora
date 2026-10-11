@@ -14,13 +14,14 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { query, queryOne } from "@/lib/db/pool";
+import { prisma } from "@/lib/db/prisma";
 import {
   createNotification,
   recomputeAggregates,
   recordActivityEvent,
   upsertPlatformAccount,
 } from "@/lib/db/repository";
+import { safeNextPath } from "@/lib/safe-path";
 import { getSessionUser } from "@/lib/server-auth";
 import {
   exchangeCodeForToken,
@@ -32,7 +33,9 @@ import { queueAndProcessAll } from "@/lib/platforms/sync-runner";
 export const dynamic = "force-dynamic";
 
 function backTo(origin: string, next: string, params: Record<string, string>) {
-  const url = new URL(next.startsWith("/") ? next : "/profile/create", origin);
+  // `next` comes from the stored handshake, but it is validated again here so
+  // a malformed row can never turn this redirect into an open redirect.
+  const url = new URL(safeNextPath(next, "/profile/create"), origin);
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value);
   }
@@ -54,17 +57,25 @@ export async function GET(request: NextRequest) {
 
   const user = await getSessionUser();
   if (!user) {
-    // Session expired mid-handshake — the state is still consumed below.
-    return NextResponse.redirect(`${origin}/login?next=/onboarding%3Fstep%3D3`);
+    // Session expired mid-handshake. Send the user back through login and on
+    // to the page that started the handshake, so they can retry there.
+    const url = new URL("/login", origin);
+    url.searchParams.set(
+      "next",
+      safeNextPath(searchParams.get("next"), "/profile/create")
+    );
+    return NextResponse.redirect(url);
   }
 
-  // Consume the state token. Single use: the delete is the guard.
-  const stateRow = await queryOne<{ user_id: string; next: string | null }>(
-    `delete from public.oauth_states
-      where state = $1 and provider = 'github' and expires_at > now()
-      returning user_id, next`,
-    [state]
-  );
+  // Consume the state token. Single use: the delete is the guard, so a
+  // replayed callback cannot consume it twice.
+  const stateRow = await prisma.oauthState.findFirst({
+    where: { state, provider: "github", expires_at: { gt: new Date() } },
+    select: { user_id: true, next: true },
+  });
+  if (stateRow) {
+    await prisma.oauthState.deleteMany({ where: { state } });
+  }
 
   if (!stateRow || stateRow.user_id !== user.id) {
     return backTo(origin, "/profile/create", {
@@ -72,7 +83,7 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  const next = stateRow.next ?? "/profile/create";
+  const next = safeNextPath(stateRow.next, "/profile/create");
   const redirectUri = new URL("/api/platforms/github/callback", origin).toString();
 
   try {
@@ -100,24 +111,27 @@ export async function GET(request: NextRequest) {
     });
 
     // 3. Store credentials server-side only. Never selected by any API route.
-    await query(
-      `insert into public.platform_oauth_tokens
-         (platform_account_id, user_id, platform, access_token, refresh_token, scope, token_type, expires_at)
-       values ($1,$2,'github',$3,$4,$5,'bearer',$6)
-       on conflict (platform_account_id) do update set
-         access_token = excluded.access_token,
-         refresh_token = coalesce(excluded.refresh_token, public.platform_oauth_tokens.refresh_token),
-         scope = excluded.scope,
-         expires_at = excluded.expires_at`,
-      [
-        accountId,
-        user.id,
-        token.accessToken,
-        token.refreshToken,
-        token.scope,
-        token.expiresAt,
-      ]
-    );
+    await prisma.platformOauthToken.upsert({
+      where: { platform_account_id: accountId },
+      create: {
+        platform_account_id: accountId,
+        user_id: user.id,
+        platform: "github",
+        access_token: token.accessToken,
+        refresh_token: token.refreshToken,
+        scope: token.scope,
+        token_type: "bearer",
+        expires_at: token.expiresAt,
+      },
+      update: {
+        access_token: token.accessToken,
+        // `undefined` leaves the stored refresh token untouched, which is
+        // exactly what `coalesce(excluded.refresh_token, existing)` did.
+        refresh_token: token.refreshToken ?? undefined,
+        scope: token.scope,
+        expires_at: token.expiresAt,
+      },
+    });
 
     await recordActivityEvent({
       userId: user.id,

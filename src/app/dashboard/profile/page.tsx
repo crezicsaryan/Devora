@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 import { DashboardShell } from "@/components/dashboard/DashboardShell";
 import { ProfileEditor } from "@/components/dashboard/ProfileEditor";
 import { getProfile } from "@/lib/db/repository";
-import { hasDatabase } from "@/lib/db/pool";
+import { hasDatabase } from "@/lib/db/prisma";
 import { getSessionUser } from "@/lib/server-auth";
 
 export const dynamic = "force-dynamic";

@@ -130,20 +130,33 @@ export const api = {
         lastSyncedAt: string | null;
         profileUrl: string | null;
       }[];
+      /**
+       * LinkedIn and the personal website are stored on the profile row, not as
+       * platform accounts — they are links, never synchronized integrations.
+       */
+      profileLinks?: { linkedin: string; portfolio: string };
     }>("/api/platforms"),
 
-  connectPlatform: (platform: string, username: string) =>
+  /**
+   * Connect or save a link. `input` is a handle OR a profile URL; the server
+   * decides which of the two outcomes applies and says so in `message`.
+   */
+  connectPlatform: (platform: string, input: string) =>
     apiFetch<{
       ok: true;
       platform: string;
-      username: string;
+      username: string | null;
       profileUrl: string | null;
       connectionStatus: string;
-    }>("/api/platforms", { method: "POST", json: { platform, username } }),
+      verification: import("@/lib/types").VerificationOutcome;
+      message: string;
+    }>("/api/platforms", { method: "POST", json: { platform, input } }),
 
-  verifyPlatform: (platform: string, username: string) =>
-    apiFetch<{ exists: boolean; message?: string; requiresOAuth?: boolean }>(
-      `/api/platforms/verify?platform=${encodeURIComponent(platform)}&u=${encodeURIComponent(username)}`
+  verifyPlatform: (platform: string, input: string) =>
+    apiFetch<
+      import("@/lib/types").PlatformVerifyResult & { linkOnly: boolean }
+    >(
+      `/api/platforms/verify?platform=${encodeURIComponent(platform)}&u=${encodeURIComponent(input)}`
     ),
 
   syncPlatform: (platform: string) =>
@@ -179,6 +192,9 @@ export const api = {
   session: () =>
     apiFetch<{
       authenticated: boolean;
+      /** Display name from the verified session; available without a database. */
+      name?: string;
+      avatarUrl?: string | null;
       onboardingCompleted: boolean;
       hasUsername?: boolean;
       onboardingStep?: number;

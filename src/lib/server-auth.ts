@@ -39,18 +39,20 @@ export async function getSessionUser(): Promise<AuthedUser | null> {
   if (!url || !key) return null;
 
   const cookieStore = await cookies();
+  // Use the deprecated CookieMethodsServerDeprecated API (get/set) which
+  // correctly handles multi-session cookies (sb-<project>-auth-token.0/1).
+  // The newer getAll/setAll API has a bug with this format.
   const supabase = createServerClient(url, key, {
     cookies: {
-      getAll() {
-        return cookieStore.getAll();
+      get(name: string) {
+        const cookie = cookieStore.get(name);
+        return cookie?.value ?? undefined;
       },
-      setAll(cookiesToSet) {
+      set(name: string, value: string, options) {
         // Route handlers can set cookies; a failure here is non-fatal because
         // the proxy refreshes the session on the next navigation.
         try {
-          cookiesToSet.forEach(({ name, value, options }) =>
-            cookieStore.set(name, value, options)
-          );
+          cookieStore.set(name, value, options);
         } catch {
           /* read-only context */
         }

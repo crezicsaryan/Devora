@@ -292,8 +292,11 @@ section("Profile links — handle extraction");
     parseProfileLink("leetcode", "https://leetcode.com/aryan").username === "aryan"
   );
   check(
-    "gfg: /user/username",
-    parseProfileLink("gfg", "https://geeksforgeeks.org/user/aryan").username === "aryan"
+    // GfG's live URL is /profile/{handle}; /user/{handle} is the legacy shape.
+    // Both must yield the handle, and neither may yield the path segment.
+    "gfg: /profile/username",
+    parseProfileLink("gfg", "https://geeksforgeeks.org/profile/aryan").username === "aryan" &&
+      parseProfileLink("gfg", "https://geeksforgeeks.org/user/aryan").username === "aryan"
   );
   check(
     "codechef: /users/username",

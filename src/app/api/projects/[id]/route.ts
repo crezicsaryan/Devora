@@ -7,7 +7,7 @@
  */
 
 import type { NextRequest } from "next/server";
-import { query, queryOne } from "@/lib/db/pool";
+import { prisma } from "@/lib/db/prisma";
 import { computeProfileCompletion, getProjects } from "@/lib/db/repository";
 import { errorResponse, okResponse, requireProfileUser } from "@/lib/server-auth";
 import type { RouteParams } from "@/lib/route-params";
@@ -43,30 +43,24 @@ export async function PATCH(
       liveUrl = v.url;
     }
 
-    const sets: string[] = [];
-    const params: unknown[] = [];
-    let i = 1;
-    const push = (col: string, value: unknown) => {
-      sets.push(`${col} = $${i++}`);
-      params.push(value);
-    };
+    const changes: Record<string, unknown> = {};
+    if (data.name !== undefined) changes.name = data.name;
+    if (data.description !== undefined) changes.description = data.description;
+    if (data.techStack !== undefined) changes.tech_stack = data.techStack;
+    if (githubUrl !== undefined) changes.github_url = githubUrl;
+    if (liveUrl !== undefined) changes.live_url = liveUrl;
 
-    if (data.name !== undefined) push("name", data.name);
-    if (data.description !== undefined) push("description", data.description);
-    if (data.techStack !== undefined) push("tech_stack", data.techStack);
-    if (githubUrl !== undefined) push("github_url", githubUrl);
-    if (liveUrl !== undefined) push("live_url", liveUrl);
+    if (Object.keys(changes).length === 0) {
+      return okResponse({ ok: true, unchanged: true });
+    }
 
-    if (sets.length === 0) return okResponse({ ok: true, unchanged: true });
-
-    params.push(id, user.id);
-    const updated = await query(
-      `update public.projects set ${sets.join(", ")}
-        where id = $${i} and user_id = $${i + 1}
-        returning id`,
-      params
-    );
-    if (updated.length === 0) {
+    // Ownership is part of the WHERE clause, never a separate check — a user
+    // cannot touch another user's project even with a valid id.
+    const updated = await prisma.project.updateMany({
+      where: { id, user_id: user.id },
+      data: changes,
+    });
+    if (updated.count === 0) {
       return errorResponse(new Error("Project not found."), "We could not find that project.");
     }
 
@@ -85,11 +79,10 @@ export async function DELETE(
     const user = await requireProfileUser();
     const { id } = await ctx.params;
 
-    const deleted = await queryOne<{ id: string }>(
-      `delete from public.projects where id = $1 and user_id = $2 returning id`,
-      [id, user.id]
-    );
-    if (!deleted) {
+    const deleted = await prisma.project.deleteMany({
+      where: { id, user_id: user.id },
+    });
+    if (deleted.count === 0) {
       return errorResponse(new Error("Project not found."), "We could not find that project.");
     }
 

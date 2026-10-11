@@ -42,3 +42,4 @@ next-env.d.ts
 
 # local dev server logs
 .dev-server*.log
+dev-server*.log

@@ -1,13 +1,16 @@
 /**
  * GET /api/public/[username] — a Devora profile as the public sees it.
  *
- * Delegates to the `devora_public_profile` Postgres function, which reads the
- * profile's visibility map and only includes fields explicitly marked public.
- * Bio, location, email, socials, skills, platforms and projects each have their
- * own switch, and nothing else is ever included.
+ * Delegates to `loadPublicProfile`, which reads the profile's visibility map
+ * and only includes fields explicitly marked public. Bio, location, email,
+ * socials, skills, platforms and projects each have their own switch, and
+ * nothing else is ever included.
+ *
+ * (On Postgres this was the `devora_public_profile()` SQL function; MySQL has
+ * no equivalent, so the same projection lives in src/lib/db/public-profile.ts.)
  */
 
-import { queryOne } from "@/lib/db/pool";
+import { loadPublicProfile } from "@/lib/db/public-profile";
 import { errorResponse, okResponse } from "@/lib/server-auth";
 import { normalizeUsername } from "@/lib/validation";
 import type { RouteParams } from "@/lib/route-params";
@@ -26,13 +29,8 @@ export async function GET(
       return errorResponse(new Error("Username is required."), "Username is required.");
     }
 
-    const row = await queryOne<{ devora_public_profile: unknown }>(
-      `select public.devora_public_profile($1) as devora_public_profile`,
-      [normalized]
-    );
-
-    const profile = row?.devora_public_profile ?? null;
-    if (!profile || (typeof profile === "object" && Object.keys(profile).length === 0)) {
+    const profile = await loadPublicProfile(normalized);
+    if (!profile) {
       return okResponse({ found: false }, { status: 404 });
     }
 

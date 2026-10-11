@@ -17,9 +17,41 @@ const platforms = [
 export default function Landing() {
   const [cardTab, setCardTab] = useState<"basic" | "premium">("premium");
   const [cursorOn, setCursorOn] = useState(false);
+  /* Signed-in state, read once from the server. Drives the nav greeting and
+     hides "Log in" once the visitor has a session. */
+  const [sessionName, setSessionName] = useState<string | null>(null);
+  const [signedIn, setSignedIn] = useState(false);
   const glowRef = useRef<HTMLDivElement>(null);
   const ringRef = useRef<HTMLDivElement>(null);
   const dotRef = useRef<HTMLDivElement>(null);
+
+  /* Who is signed in? `/api/session` resolves the Supabase session server-side
+     and returns the display name, so this needs no database round trip. */
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/session", { cache: "no-store" })
+      .then((res) =>
+        res.ok
+          ? (res.json() as Promise<{ authenticated?: boolean; name?: string }>)
+          : null
+      )
+      .then((data) => {
+        if (!alive || !data) return;
+        setSignedIn(Boolean(data.authenticated));
+        if (typeof data.name === "string" && data.name.trim()) {
+          setSessionName(data.name.trim());
+        }
+      })
+      // A signed-out visitor and an unreachable server look the same here:
+      // show the logged-out nav rather than an error.
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /** "Aryan Singh" -> "Aryan" */
+  const firstName = sessionName?.split(/\s+/)[0] ?? null;
 
   /* premium mouse-pointer effect: dot + trailing ring + ambient glow */
   useEffect(() => {
@@ -97,10 +129,21 @@ export default function Landing() {
             <a href="#blog">Blog</a>
           </nav>
           <div className={styles.navActions}>
-            <Link href="/login" className={styles.btnGhost}>Log in</Link>
-            <Link href="/signup" className={styles.btnPrimary}>
-              Get Started <ArrowIcon />
-            </Link>
+            {signedIn ? (
+              <>
+                <span className={styles.greeting}>Hello, {firstName ?? "developer"}</span>
+                <Link href="/dashboard" className={styles.btnPrimary}>
+                  Go to Dashboard <ArrowIcon />
+                </Link>
+              </>
+            ) : (
+              <>
+                <Link href="/login" className={styles.btnGhost}>Log in</Link>
+                <Link href="/signup" className={styles.btnPrimary}>
+                  Get Started <ArrowIcon />
+                </Link>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -443,6 +486,11 @@ export default function Landing() {
               alt="Devora Basic identity card — front and back design"
               width={1536}
               height={1024}
+              /* The card never renders wider than 560px (.idShowcase), but
+                 without `sizes` Next assumes the full 1536px intrinsic width
+                 and the browser downloads the 1920px variant (~508 KB) instead
+                 of the 640px one (~97 KB). */
+              sizes="(max-width: 1020px) 92vw, 560px"
               className={styles.idShowcaseImg}
               priority={false}
             />
@@ -455,6 +503,7 @@ export default function Landing() {
               alt="Devora Pro identity card — front and back design"
               width={1536}
               height={1024}
+              sizes="(max-width: 1020px) 92vw, 560px"
               className={styles.idShowcaseImg}
               priority={false}
             />

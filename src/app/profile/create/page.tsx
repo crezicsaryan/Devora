@@ -3,7 +3,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getProfile, isOnboardingComplete } from "@/lib/db/repository";
-import { hasDatabase } from "@/lib/db/pool";
+import { hasDatabase } from "@/lib/db/prisma";
 import { getSessionUser } from "@/lib/server-auth";
 import { initialsOf } from "@/lib/avatar";
 import { ProfileCreateForm } from "@/components/profile/ProfileCreateForm";

@@ -94,8 +94,12 @@ export const LINK_SPECS: LinkSpec[] = [
     storage: { kind: "platform", platform: "gfg" },
     host: "geeksforgeeks.org",
     logo: "/platform-logos/gfg.png",
-    placeholder: "https://geeksforgeeks.org/user/username",
-    handleFromPath: (p) => afterPrefix(p, "user") ?? firstSegment(p),
+    placeholder: "https://geeksforgeeks.org/profile/username",
+    // GfG's live profile URL is `/profile/{handle}`. The legacy `/user/{handle}`
+    // shape is still accepted, but it must come SECOND: with the old ordering a
+    // `/profile/crezicsaryan` link extracted the literal handle "profile".
+    handleFromPath: (p) =>
+      afterPrefix(p, "profile") ?? afterPrefix(p, "user") ?? firstSegment(p),
     note: "Link only — no statistics until you sync.",
   },
   {
@@ -148,6 +152,113 @@ export const LINK_BY_KEY: Record<LinkKey, LinkSpec> = Object.fromEntries(
 export const SYNCABLE_LINK_KEYS: LinkKey[] = LINK_SPECS.filter(
   (s) => s.storage.kind === "platform"
 ).map((s) => s.key);
+
+/**
+ * The canonical profile URL for a platform and handle.
+ *
+ * Mirrors the `placeholder` shapes above, so a handle typed by hand and a URL
+ * pasted by hand end up storing the same link.
+ */
+const PLATFORM_PATH: Record<PlatformKey, (handle: string) => string> = {
+  github: (h) => `/${h}`,
+  leetcode: (h) => `/u/${h}`,
+  gfg: (h) => `/profile/${h}`,
+  codechef: (h) => `/users/${h}`,
+  codeforces: (h) => `/profile/${h}`,
+  hackerrank: (h) => `/profile/${h}`,
+};
+
+export function profileUrlFor(platform: PlatformKey, handle: string): string {
+  const spec = LINK_BY_KEY[platform as LinkKey];
+  const path = PLATFORM_PATH[platform]?.(encodeURIComponent(handle));
+  if (!spec || !path) return "";
+  return `https://${spec.host}${path}`;
+}
+
+/** Characters a platform handle may contain. Anything else is rejected. */
+const HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,59}$/;
+
+export type ResolvedPlatformInput = {
+  /** The handle, or null when the input was a URL we could not read a handle from. */
+  username: string | null;
+  /** The canonical profile URL when we could build or validate one. */
+  url: string | null;
+  /** A user-facing reason the input cannot be used. */
+  error: string | null;
+};
+
+/**
+ * Accept EITHER a handle or a profile URL for one platform.
+ *
+ * Rules that matter:
+ *   - A URL is validated against the platform's own host, so a LeetCode field
+ *     can never hold a github.com link.
+ *   - A handle is taken out of the path with that platform's own rule; if no
+ *     handle can be found the input is REJECTED rather than guessing at part
+ *     of the path.
+ *   - Input is never silently truncated: an over-long value is an error, not a
+ *     quieter version of itself.
+ */
+export function resolvePlatformInput(
+  platform: PlatformKey,
+  input: unknown
+): ResolvedPlatformInput {
+  const spec = LINK_BY_KEY[platform as LinkKey];
+  if (!spec) {
+    return { username: null, url: null, error: "Unknown platform." };
+  }
+
+  const raw = typeof input === "string" ? input.trim() : "";
+  if (!raw) {
+    return {
+      username: null,
+      url: null,
+      error: "Enter your username or paste your profile URL.",
+    };
+  }
+  if (raw.length > 200) {
+    return {
+      username: null,
+      url: null,
+      error: "That is longer than a username or profile URL should be.",
+    };
+  }
+
+  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw);
+  const looksLikeUrl =
+    hasScheme || raw.includes("/") || raw.toLowerCase().includes(spec.host);
+
+  if (!looksLikeUrl) {
+    if (!HANDLE_RE.test(raw)) {
+      return {
+        username: null,
+        url: null,
+        error: `${spec.label} usernames can contain letters, numbers, dots, underscores and hyphens only.`,
+      };
+    }
+    return { username: raw, url: profileUrlFor(platform, raw), error: null };
+  }
+
+  const parsed = parseProfileLink(platform as LinkKey, raw);
+  if (parsed.error) {
+    return { username: null, url: null, error: parsed.error };
+  }
+  if (!parsed.url || !parsed.username) {
+    return {
+      username: null,
+      url: parsed.url ?? null,
+      error: `We could not find a ${spec.label} username in that URL. Paste the link to your profile page.`,
+    };
+  }
+
+  return {
+    username: parsed.username,
+    // Keep the URL the user gave us, but only after it passed host validation —
+    // never rewrite it into something they did not type.
+    url: parsed.url,
+    error: null,
+  };
+}
 
 export type ParsedLink = {
   key: LinkKey;

@@ -1,11 +1,16 @@
 "use client";
 
 /**
- * The dashboard view.
+ * The Devora dashboard.
  *
  * One authenticated request (`GET /api/dashboard`) provides every number on
- * this screen. Nothing is hardcoded: a metric the backend cannot source comes
- * back as null and renders as "—".
+ * this screen, including the full daily activity series. Range and granularity
+ * switches then filter that series locally, so changing "Last 30 Days" to
+ * "This Year" never triggers a round trip or a page reload.
+ *
+ * Nothing is hardcoded. A metric the backend cannot source comes back as null
+ * and renders as "—"; a section with no data shows a real empty state instead
+ * of a placeholder chart.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -13,15 +18,33 @@ import Image from "next/image";
 import Link from "next/link";
 import { api } from "@/lib/api-client";
 import {
-  ACTIVITY_RANGES,
+  GRANULARITIES,
+  HEATMAP_RANGES,
   PLATFORM_BY_KEY,
+  PROBLEMS_RANGES,
   TOPIC_ORDER,
-  type ActivityRange,
   type ConnectedPlatform,
   type DashboardPayload,
+  type GraphGranularity,
+  type HeatmapRange,
   type PlatformKey,
+  type ProblemsRange,
 } from "@/lib/types";
-import { ActivityChart, DifficultyBars, DifficultyDonut, MiniBar } from "@/components/dashboard/charts";
+import {
+  buildHeatmapGrid,
+  bucketSeries,
+  sliceSeries,
+  type GraphBucket,
+} from "@/lib/dashboard-metrics";
+import {
+  ActivityHeatmap,
+  ComparisonBars,
+  DifficultyBars,
+  DifficultyDonut,
+  LineTrendChart,
+  MiniBar,
+  type TrendSeries,
+} from "@/components/dashboard/charts";
 import styles from "@/app/dashboard/dashboard.module.css";
 
 const SYNC_LABEL: Record<string, string> = {
@@ -31,34 +54,30 @@ const SYNC_LABEL: Record<string, string> = {
   idle: "Not synced",
 };
 
+const ACTIVITY_SERIES: TrendSeries[] = [
+  { key: "activities", label: "Activities", color: "#ff6a00" },
+];
+
+const PROBLEMS_SERIES: TrendSeries[] = [
+  { key: "problems", label: "Problems solved", color: "#4ade80" },
+];
+
 export function DashboardView() {
   const [data, setData] = useState<DashboardPayload | null>(null);
-  const [range, setRange] = useState<ActivityRange>("30d");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [syncingAll, setSyncingAll] = useState(false);
 
-  const load = useCallback(
-    async (nextRange: ActivityRange, opts?: { silent?: boolean }) => {
-      if (!opts?.silent) setLoading(true);
-      const res = await api.dashboard(nextRange);
-      if (res.ok) {
-        setData(res.data);
-        setError(null);
-      } else {
-        setError(res.error);
-      }
-      setLoading(false);
-    },
-    []
-  );
+  // Activity heatmap + activity graph share one range; the problems graph has
+  // its own, because the product asks for different windows on each.
+  const [range, setRange] = useState<HeatmapRange>("this-year");
+  const [granularity, setGranularity] = useState<GraphGranularity>("weekly");
+  const [problemsRange, setProblemsRange] = useState<ProblemsRange>("30d");
 
   useEffect(() => {
     let alive = true;
-    // The request resolves before any state is written, so this never causes a
-    // synchronous cascading render.
     void (async () => {
-      const res = await api.dashboard(range);
+      const res = await api.dashboard("30d");
       if (!alive) return;
       if (res.ok) {
         setData(res.data);
@@ -71,7 +90,15 @@ export function DashboardView() {
     return () => {
       alive = false;
     };
-  }, [range]);
+  }, []);
+
+  const reload = useCallback(async () => {
+    const res = await api.dashboard("30d");
+    if (res.ok) {
+      setData(res.data);
+      setError(null);
+    }
+  }, []);
 
   const refreshAll = useCallback(async () => {
     if (!data) return;
@@ -83,11 +110,32 @@ export function DashboardView() {
     for (const platform of platforms) {
       await api.syncPlatform(platform);
     }
-    await load(range, { silent: true });
+    await reload();
     setSyncingAll(false);
-  }, [data, range, load]);
+  }, [data, reload]);
 
-  // Client-side only: the server has no idea what time it is for the user.
+  const daily = data?.daily ?? [];
+
+  const heatmapGrid = useMemo(
+    () => buildHeatmapGrid(daily, range),
+    [daily, range]
+  );
+
+  const activityBuckets = useMemo(
+    () => bucketSeries(sliceSeries(daily, range, { fill: true }), granularity),
+    [daily, range, granularity]
+  );
+
+  const problemsBuckets = useMemo(
+    () =>
+      bucketSeries(
+        sliceSeries(daily, problemsRange, { fill: true }),
+        autoGranularity(problemsRange)
+      ),
+    [daily, problemsRange]
+  );
+
+  // Client-side only: the server cannot know the user's local time of day.
   const greeting = useMemo(() => greetingFor(new Date()), []);
 
   if (loading && !data) return <DashboardSkeleton />;
@@ -102,24 +150,48 @@ export function DashboardView() {
 
   if (!data) return null;
 
-  const { profile, plans, stats, connectedPlatforms, difficulty, topics, events, projects, achievements, syncJobs } = data;
+  const {
+    profile,
+    plans,
+    stats,
+    connectedPlatforms,
+    difficulty,
+    topics,
+    events,
+    projects,
+    syncJobs,
+    streak,
+    github,
+    monthly,
+    yearly,
+    personalBests,
+    achievementsSummary,
+    monthlyLeaderboard,
+    leaderboardAvailable,
+  } = data;
 
-  const earned = achievements.filter((a) => a.unlockedAt);
+  const firstName = profile.displayName?.trim().split(/\s+/)[0] || "Developer";
   const topicMap = new Map(topics.map((t) => [t.topic, t]));
-  const orderedTopics = TOPIC_ORDER.map((name) => topicMap.get(name) ?? { topic: name, solved: 0, total: 0 });
+  const orderedTopics = TOPIC_ORDER.map(
+    (name) => topicMap.get(name) ?? { topic: name, solved: 0, total: 0 }
+  );
   for (const t of topics) {
     if (!TOPIC_ORDER.includes(t.topic)) orderedTopics.push(t);
   }
+  const hasTopicData = orderedTopics.some((t) => t.solved > 0 || t.total > 0);
+
+  // §24 — a brand-new account: no platforms and no real activity yet.
+  const isNewUser = connectedPlatforms.length === 0 && streak.isEmpty;
 
   return (
     <div>
-      {/* ------------------------------ hero ------------------------------ */}
+      {/* 1 ───────────────────────── welcome / header ───────────────────── */}
       <section className={styles.hero}>
         <div className={styles.heroText}>
           <h1>
-            {greeting}, {profile.displayName?.split(" ")[0] || "Developer"} 👋
+            {greeting}, {firstName} 👋
           </h1>
-          <p>Here&apos;s your coding journey at a glance.</p>
+          <p>Track your coding journey and developer progress in one place.</p>
         </div>
 
         <div className={styles.heroRight}>
@@ -148,292 +220,724 @@ export function DashboardView() {
         </div>
       </section>
 
-      {!plans.onboardingCompleted && (
-        <div className={`${styles.banner} ${styles.section}`} data-tone="info">
-          <span>Your setup is not finished yet. Complete onboarding to unlock sync and analytics.</span>
-        </div>
+      {isNewUser ? (
+        <NewUserPanel />
+      ) : (
+        <>
+          {/* 2 ─────────────────────────── summary cards ─────────────────── */}
+          <div className={styles.statGrid5}>
+            <StatCard
+              label="Total Problems Solved"
+              value={stats.totalSolved}
+              note={
+                stats.totalSolved == null
+                  ? "Connect a platform to start counting"
+                  : "Across all connected platforms"
+              }
+              glyph={<CodeGlyph />}
+            />
+            <StatCard
+              label="Current Streak"
+              value={stats.currentStreak}
+              suffix={stats.currentStreak ? " Days" : undefined}
+              note={
+                stats.currentStreak == null
+                  ? "No active coding days yet"
+                  : "Keep it going"
+              }
+              glyph={<FlameGlyph />}
+            />
+            <StatCard
+              label="Longest Streak"
+              value={stats.longestStreak}
+              suffix={stats.longestStreak ? " Days" : undefined}
+              note={
+                stats.longestStreak == null ? "No streak history yet" : "Personal best"
+              }
+              glyph={<TrophyGlyph />}
+            />
+            <StatCard
+              label="Active Days"
+              value={stats.activeDays > 0 ? stats.activeDays : null}
+              suffix={stats.activeDays > 0 ? " Days" : undefined}
+              note={
+                stats.activeDays > 0
+                  ? "Days with real coding activity"
+                  : "No coding days recorded yet"
+              }
+              glyph={<CalendarGlyph />}
+            />
+            <StatCard
+              label="Platforms Connected"
+              value={stats.platformsConnected > 0 ? stats.platformsConnected : null}
+              suffix={stats.platformsConnected > 0 ? " Platforms" : undefined}
+              note={
+                stats.platformsConnected > 0
+                  ? "Verified connections only"
+                  : "No platforms connected yet"
+              }
+              glyph={<LinkGlyph />}
+            />
+          </div>
+
+          {/* 3 ────────────────────────── activity heatmap ───────────────── */}
+          <section className={styles.section}>
+            <div className={styles.chartHead}>
+              <h2 className={styles.sectionTitle}>Coding activity</h2>
+              <RangeTabs
+                options={HEATMAP_RANGES.map((r) => ({ key: r.key, label: r.label }))}
+                value={range}
+                onChange={(key) => setRange(key as HeatmapRange)}
+              />
+            </div>
+            <div className={styles.card}>
+              <ActivityHeatmap grid={heatmapGrid} />
+            </div>
+          </section>
+
+          {/* 4 ─────────────────────── activity graph ────────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.chartHead}>
+              <h2 className={styles.sectionTitle}>Coding activity over time</h2>
+              <RangeTabs
+                options={GRANULARITIES.map((g) => ({ key: g.key, label: g.label }))}
+                value={granularity}
+                onChange={(key) => setGranularity(key as GraphGranularity)}
+              />
+            </div>
+            <div className={styles.card}>
+              <LineTrendChart
+                buckets={activityBuckets}
+                series={ACTIVITY_SERIES}
+                unit={granularity === "daily" ? "activities" : "activities"}
+              />
+            </div>
+          </section>
+
+          {/* 5 ─────────────────────── problems graph ────────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.chartHead}>
+              <h2 className={styles.sectionTitle}>Problems solved over time</h2>
+              <RangeTabs
+                options={PROBLEMS_RANGES.map((r) => ({ key: r.key, label: r.label }))}
+                value={problemsRange}
+                onChange={(key) => setProblemsRange(key as ProblemsRange)}
+              />
+            </div>
+            <div className={styles.card}>
+              <LineTrendChart
+                buckets={problemsBuckets}
+                series={PROBLEMS_SERIES}
+                unit="solved"
+              />
+            </div>
+          </section>
+
+          {/* 6 ────────────────────────── coding platforms ───────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Coding platforms</h2>
+              <Link href="/dashboard/platforms" className={styles.sectionLink}>
+                Manage platforms →
+              </Link>
+            </div>
+
+            {connectedPlatforms.length === 0 ? (
+              <div className={styles.empty}>
+                <strong>No coding platforms connected yet.</strong>
+                <span>Connect a platform to start tracking your coding progress.</span>
+                <Link
+                  href="/dashboard/platforms"
+                  className={styles.btnPrimary}
+                  style={{ marginTop: 4 }}
+                >
+                  Connect Platform
+                </Link>
+              </div>
+            ) : (
+              <div className={styles.platformGrid}>
+                {connectedPlatforms.map((p) => (
+                  <PlatformStatCard
+                    key={p.account.id}
+                    platform={p}
+                    syncJob={syncJobs.find((j) => j.platform === p.account.platform)}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* 7 + 8 ───────────────── comparison + difficulty ─────────────── */}
+          <div className={styles.cols}>
+            <div className={styles.card}>
+              <h2 className={styles.sectionTitle} style={{ marginBottom: 14 }}>
+                Platform comparison
+              </h2>
+              {data.platformComparison.length === 0 ? (
+                <p className={styles.hint}>
+                  No platform reports a solved count yet. Connect LeetCode, Codeforces,
+                  CodeChef or GeeksforGeeks to compare.
+                </p>
+              ) : data.platformComparison.length === 1 ? (
+                <ComparisonBars rows={data.platformComparison} />
+              ) : (
+                <ComparisonBars rows={data.platformComparison} />
+              )}
+            </div>
+
+            <div className={styles.card}>
+              <h2 className={styles.sectionTitle} style={{ marginBottom: 14 }}>
+                Problem difficulty
+              </h2>
+              {difficulty.available && difficulty.total > 0 ? (
+                <div className={styles.donutWrap}>
+                  <div className={styles.donut}>
+                    <DifficultyDonut breakdown={difficulty} />
+                  </div>
+                  <div style={{ flex: "1 1 150px", minWidth: 0 }}>
+                    <DifficultyBars breakdown={difficulty} />
+                  </div>
+                </div>
+              ) : (
+                <div className={styles.empty}>
+                  <strong>No problem data available yet.</strong>
+                  <span>
+                    Connect a platform that publishes problem difficulty (LeetCode or
+                    Codeforces) to see this breakdown.
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 9 ────────────────────────── topic progress ─────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Topic progress</h2>
+              <Link href="/dashboard/topics" className={styles.sectionLink}>
+                View topics →
+              </Link>
+            </div>
+
+            {hasTopicData ? (
+              <div className={styles.card}>
+                <div className={styles.topicList}>
+                  {orderedTopics.map((t) => (
+                    <div key={t.topic} className={styles.topicRow}>
+                      <div className={styles.topicTop}>
+                        <span className={styles.topicName}>{t.topic}</span>
+                        <span className={styles.topicValue}>
+                          {t.solved}
+                          <span>
+                            /{t.total || 0}
+                            {"  "}
+                            {t.total > 0 ? `${Math.round((t.solved / t.total) * 100)}%` : "0%"}
+                          </span>
+                        </span>
+                      </div>
+                      <MiniBar value={t.solved} total={t.total} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className={styles.empty}>
+                <strong>Start solving problems to see topic progress.</strong>
+                <span>
+                  Track questions in the question tracker and per-topic progress appears here.
+                </span>
+                <Link href="/dashboard/tracker" className={styles.btnGhost} style={{ marginTop: 4 }}>
+                  Open question tracker
+                </Link>
+              </div>
+            )}
+          </section>
+
+          {/* 10 ────────────────────────── github overview ───────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>GitHub overview</h2>
+              <Link href="/dashboard/platforms" className={styles.sectionLink}>
+                Manage →
+              </Link>
+            </div>
+
+            {github ? (
+              <div className={styles.card}>
+                <div className={styles.metaGrid}>
+                  <MetaCell label="Repositories" value={github.repositories} />
+                  <MetaCell label="Followers" value={github.followers} />
+                  <MetaCell label="Following" value={github.following} />
+                  <MetaCell label="Contributions" value={github.contributions} />
+                  <MetaCell label="Stars" value={github.stars} />
+                  {/* No honest source for these yet — shown as "—", never guessed. */}
+                  <MetaCell label="Commits" value={github.commits} />
+                  <MetaCell label="Pull requests" value={github.pullRequests} />
+                  <MetaCell label="Issues" value={github.issues} />
+                </div>
+
+                <div style={{ marginTop: 16 }}>
+                  <div className={styles.subHead}>Most-used languages</div>
+                  {github.languages.length === 0 ? (
+                    <p className={styles.hint}>
+                      No language data stored yet — run a GitHub sync to populate it.
+                    </p>
+                  ) : (
+                    <div className={styles.langList}>
+                      {github.languages.slice(0, 8).map((l) => (
+                        <span key={l.name} className={styles.chip}>
+                          {l.name} · {l.count}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className={styles.metaFoot}>
+                  <span className={styles.syncState} data-state={github.syncStatus}>
+                    {github.syncStatus === "ok"
+                      ? "✓ Connected"
+                      : github.syncStatus === "failed"
+                        ? "⚠ Sync failed"
+                        : "⟳ Syncing"}
+                  </span>
+                  {github.lastSyncedAt && (
+                    <span className={styles.hint}>
+                      Last synced {relativeTime(github.lastSyncedAt)}
+                    </span>
+                  )}
+                  {github.profileUrl && (
+                    <a
+                      href={github.profileUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={styles.projectLink}
+                    >
+                      @{github.username} ↗
+                    </a>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className={styles.empty}>
+                <strong>GitHub isn&apos;t connected yet.</strong>
+                <span>Connect GitHub to track your development activity.</span>
+                <Link
+                  href="/dashboard/platforms"
+                  className={styles.btnPrimary}
+                  style={{ marginTop: 4 }}
+                >
+                  Connect GitHub
+                </Link>
+              </div>
+            )}
+          </section>
+
+          {/* 11 ───────────────────── recent coding activity ─────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Recent activity</h2>
+            </div>
+            <div className={styles.card}>
+              {events.length === 0 ? (
+                <p className={styles.hint}>
+                  Nothing has happened yet. Solve a problem or sync a platform and your
+                  activity appears here.
+                </p>
+              ) : (
+                <ul className={styles.feed}>
+                  {events.slice(0, 10).map((e) => (
+                    <li key={e.id} className={styles.feedItem}>
+                      <span className={styles.feedIcon}>{eventGlyph(e.kind)}</span>
+                      <div className={styles.feedBody}>
+                        <span className={styles.feedTitle}>
+                          {e.href ? (
+                            <Link href={e.href} style={{ color: "inherit" }}>
+                              {e.title}
+                            </Link>
+                          ) : (
+                            e.title
+                          )}
+                        </span>
+                        <span className={styles.feedMeta}>
+                          {e.detail ? `${e.detail} · ` : ""}
+                          {relativeTime(e.occurredAt)}
+                        </span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </section>
+
+          {/* 12 ───────────────────────── coding streak ─────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Coding streak</h2>
+            </div>
+            <div className={styles.statGrid4}>
+              <MiniStat label="Current Streak" value={streak.current} suffix=" days" />
+              <MiniStat label="Longest Streak" value={streak.longest} suffix=" days" />
+              <MiniStat label="Active Days" value={streak.activeDays} suffix=" days" />
+              <MiniStat
+                label="Total Coding Activities"
+                value={streak.totalActivities}
+                suffix=""
+              />
+            </div>
+            <p className={styles.hint} style={{ marginTop: 10 }}>
+              A coding day means at least one real coding activity. Logins, profile
+              views and dashboard visits are never counted.
+            </p>
+          </section>
+
+          {/* 13 ──────────────────────── monthly progress ────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>This month</h2>
+              <span className={styles.hint}>{monthly.label}</span>
+            </div>
+            <div className={styles.card}>
+              <div className={styles.statGrid4}>
+                <MiniStat label="Problems Solved" value={monthly.problemsSolved} />
+                <MiniStat label="Active Days" value={monthly.activeDays} suffix=" days" />
+                <MiniStat label="Coding Activities" value={monthly.activities} />
+                <MiniStat label="Current Streak" value={monthly.currentStreak} suffix=" days" />
+              </div>
+              {monthly.problemsChangePercent != null && monthly.previous && (
+                <p className={styles.changeRow} data-up={monthly.problemsChangePercent >= 0}>
+                  {monthly.problemsChangePercent >= 0 ? "▲" : "▼"}{" "}
+                  {Math.abs(monthly.problemsChangePercent)}% vs {monthly.previous.label}
+                  <span className={styles.hint}>
+                    {" "}
+                    ({monthly.previous.problemsSolved} problems last month)
+                  </span>
+                </p>
+              )}
+              {monthly.problemsChangePercent == null && (
+                <p className={styles.hint} style={{ marginTop: 12 }}>
+                  Not enough history to compare with last month yet.
+                </p>
+              )}
+            </div>
+          </section>
+
+          {/* 14 ──────────────────────── yearly overview ─────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Your coding year</h2>
+              <span className={styles.hint}>{yearly.year}</span>
+            </div>
+            <div className={styles.card}>
+              {yearly.hasData ? (
+                <>
+                  <div className={styles.statGrid4}>
+                    <MiniStat label="Problems Solved" value={yearly.problemsSolved} />
+                    <MiniStat label="Active Days" value={yearly.activeDays} suffix=" days" />
+                    <MiniStat
+                      label="Longest Streak"
+                      value={yearly.longestStreak}
+                      suffix=" days"
+                    />
+                    <MiniStat label="Total Activities" value={yearly.activities} />
+                  </div>
+                  <div className={styles.threeCol} style={{ marginTop: 18 }}>
+                    <Highlight
+                      label="Most Active Month"
+                      value={yearly.mostActiveMonth?.label ?? null}
+                      sub={
+                        yearly.mostActiveMonth
+                          ? `${yearly.mostActiveMonth.activities} activities`
+                          : undefined
+                      }
+                    />
+                    <Highlight
+                      label="Most Solved Topic"
+                      value={yearly.mostSolvedTopic?.topic ?? null}
+                      sub={
+                        yearly.mostSolvedTopic
+                          ? `${yearly.mostSolvedTopic.solved} solved`
+                          : undefined
+                      }
+                    />
+                    <Highlight
+                      label="Most Used Platform"
+                      value={yearly.mostUsedPlatform?.label ?? null}
+                      sub={
+                        yearly.mostUsedPlatform
+                          ? `${yearly.mostUsedPlatform.solved} solved`
+                          : undefined
+                      }
+                    />
+                  </div>
+                </>
+              ) : (
+                <p className={styles.hint}>
+                  No coding activity recorded in {yearly.year} yet.
+                </p>
+              )}
+            </div>
+          </section>
+
+          {/* 15 ───────────────────────── personal bests ─────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Personal bests</h2>
+            </div>
+            <div className={styles.card}>
+              {personalBests.hasData ? (
+                <div className={styles.threeCol}>
+                  <Highlight
+                    label="Longest Streak"
+                    value={personalBests.longestStreak > 0 ? `${personalBests.longestStreak} days` : null}
+                  />
+                  <Highlight
+                    label="Most Problems in One Day"
+                    value={
+                      personalBests.mostProblemsInADay
+                        ? String(personalBests.mostProblemsInADay.problems)
+                        : null
+                    }
+                    sub={
+                      personalBests.mostProblemsInADay
+                        ? formatLongDay(personalBests.mostProblemsInADay.day)
+                        : undefined
+                    }
+                  />
+                  <Highlight
+                    label="Most Problems in One Month"
+                    value={
+                      personalBests.mostProblemsInAMonth
+                        ? String(personalBests.mostProblemsInAMonth.problems)
+                        : null
+                    }
+                    sub={personalBests.mostProblemsInAMonth?.label}
+                  />
+                  <Highlight
+                    label="Most Active Month"
+                    value={personalBests.mostActiveMonth?.label ?? null}
+                    sub={
+                      personalBests.mostActiveMonth
+                        ? `${personalBests.mostActiveMonth.activities} activities`
+                        : undefined
+                    }
+                  />
+                  <Highlight
+                    label="Most Active Week"
+                    value={
+                      personalBests.mostActiveWeek
+                        ? `${personalBests.mostActiveWeek.activities}`
+                        : null
+                    }
+                    sub={
+                      personalBests.mostActiveWeek
+                        ? `${formatShortDay(personalBests.mostActiveWeek.start)} – ${formatShortDay(personalBests.mostActiveWeek.end)}`
+                        : undefined
+                    }
+                  />
+                </div>
+              ) : (
+                <p className={styles.hint}>Keep coding to unlock personal bests.</p>
+              )}
+            </div>
+          </section>
+
+          {/* 16 ────────────────────────── achievements ──────────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Achievements</h2>
+              <Link href="/dashboard/achievements" className={styles.sectionLink}>
+                View all achievements →
+              </Link>
+            </div>
+
+            {achievementsSummary.totalCount === 0 ? (
+              <div className={styles.empty}>
+                <strong>No achievements available yet.</strong>
+                <span>The achievement catalogue has not been seeded in this database.</span>
+              </div>
+            ) : (
+              <>
+                {achievementsSummary.unlockedCount === 0 ? (
+                  <p className={styles.hint} style={{ marginBottom: 12 }}>
+                    No achievements unlocked yet — badges are awarded automatically as you
+                    progress.
+                  </p>
+                ) : null}
+                <div className={styles.achGrid}>
+                  {achievementsSummary.unlocked.slice(0, 4).map((a) => (
+                    <div key={a.code} className={styles.achCard} data-earned="true">
+                      <span className={styles.achGlyph}>{a.icon || "★"}</span>
+                      <span className={styles.achName}>{a.title}</span>
+                      <span className={styles.achDesc}>{a.description}</span>
+                      <span className={styles.achDate}>
+                        Unlocked {relativeTime(a.unlockedAt)}
+                      </span>
+                    </div>
+                  ))}
+                  {achievementsSummary.locked.slice(0, 4).map((a) => (
+                    <div key={a.code} className={styles.achCard} data-earned="false">
+                      <span className={styles.achGlyph} data-locked="true">
+                        {a.icon || "★"}
+                      </span>
+                      <span className={styles.achName}>{a.title}</span>
+                      <span className={styles.achDesc}>{a.description}</span>
+                      <div className={styles.progTrack}>
+                        <div
+                          className={styles.progFill}
+                          style={{
+                            width: `${a.threshold > 0 ? (a.progress / a.threshold) * 100 : 0}%`,
+                          }}
+                        />
+                      </div>
+                      <span className={styles.achDate}>
+                        {a.progress} / {a.threshold}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <p className={styles.hint} style={{ marginTop: 12 }}>
+                  {achievementsSummary.unlockedCount} of {achievementsSummary.totalCount}{" "}
+                  unlocked
+                </p>
+              </>
+            )}
+          </section>
+
+          {/* 17 ────────────────────── monthly leaderboard ───────────────── */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Monthly leaderboard</h2>
+              <Link href="/dashboard/leaderboard" className={styles.sectionLink}>
+                Full leaderboard →
+              </Link>
+            </div>
+            <div className={styles.card}>
+              {!leaderboardAvailable ? (
+                <p className={styles.hint}>Leaderboard coming soon.</p>
+              ) : monthlyLeaderboard.length === 0 ? (
+                <p className={styles.hint}>
+                  No one has logged coding activity this month yet. Rankings are based on
+                  real activity, so the board starts when activity does.
+                </p>
+              ) : (
+                <ul className={styles.lbList}>
+                  {monthlyLeaderboard.slice(0, 10).map((row) => (
+                    <li
+                      key={`${row.rank}-${row.username}`}
+                      className={styles.lbRow}
+                      data-me={row.isCurrentUser}
+                    >
+                      <span className={styles.lbRank}>#{row.rank}</span>
+                      <span className={styles.lbAvatar}>
+                        {row.avatarUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={row.avatarUrl} alt="" />
+                        ) : (
+                          initialsOf(row.displayName || row.username)
+                        )}
+                      </span>
+                      <span className={styles.lbUser}>
+                        <span className={styles.lbName}>{row.displayName || row.username}</span>
+                        <span className={styles.lbHandle}>@{row.username}</span>
+                      </span>
+                      <span className={styles.lbStat}>
+                        {row.problemsSolved}
+                        <span className={styles.lbStatLabel}>solved</span>
+                      </span>
+                      <span className={styles.lbScore}>{row.score}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </section>
+        </>
       )}
 
-      {/* ----------------------------- stat cards -------------------------- */}
-      <div className={styles.statGrid}>
-        <StatCard
-          label="Total Problems Solved"
-          value={stats.totalSolved}
-          note={
-            stats.totalSolved == null
-              ? "Connect a platform to start counting"
-              : "Across all connected platforms"
-          }
-          glyph={<CodeGlyph />}
-        />
-        <StatCard
-          label="Current Streak"
-          value={stats.currentStreak}
-          suffix={stats.currentStreak ? " days" : undefined}
-          note={stats.currentStreak == null ? "No recent submissions" : "Keep it going"}
-          glyph={<FlameGlyph />}
-        />
-        <StatCard
-          label="Longest Streak"
-          value={stats.longestStreak}
-          suffix={stats.longestStreak ? " days" : undefined}
-          note={stats.longestStreak == null ? "No streak history yet" : "Personal best"}
-          glyph={<TrophyGlyph />}
-        />
-        <StatCard
-          label="GitHub Contributions"
-          value={stats.githubContributions}
-          note={
-            stats.githubContributions == null
-              ? "Connect GitHub to see this"
-              : "Contributions in the last year"
-          }
-          glyph={<GitHubGlyph />}
-        />
-      </div>
-
-      {/* --------------------------- platform stats ------------------------ */}
-      <section className={styles.section}>
-        <div className={styles.sectionHead}>
-          <h2 className={styles.sectionTitle}>Platform statistics</h2>
-          <Link href="/dashboard/platforms" className={styles.sectionLink}>
-            Manage platforms →
-          </Link>
-        </div>
-
-        {connectedPlatforms.length === 0 ? (
-          <div className={styles.empty}>
-            <strong>No platforms connected yet.</strong>
-            <span>
-              Connect LeetCode, CodeChef, Codeforces, GeeksforGeeks, HackerRank or GitHub and your
-              statistics will appear here.
-            </span>
-            <Link href="/dashboard/platforms" className={styles.btnPrimary} style={{ marginTop: 4 }}>
-              Connect a platform
+      {/* Recent projects — the dashboard's own sections are ordered above; this
+          stays last so nothing the app already offered is lost. */}
+      {!isNewUser && (
+        <section className={styles.section}>
+          <div className={styles.sectionHead}>
+            <h2 className={styles.sectionTitle}>Recent projects</h2>
+            <Link href="/dashboard/projects" className={styles.sectionLink}>
+              View all →
             </Link>
           </div>
-        ) : (
-          <div className={styles.platformGrid}>
-            {connectedPlatforms.map((p) => (
-              <PlatformStatCard key={p.account.id} platform={p} />
+          <div className={styles.projectGrid}>
+            {projects.slice(0, 3).map((p) => (
+              <ProjectCard key={p.id} project={p} />
             ))}
-          </div>
-        )}
-      </section>
-
-      {/* ------------------------- activity + difficulty ------------------- */}
-      <div className={styles.cols}>
-        <div className={styles.card}>
-          <div className={styles.chartHead}>
-            <h2 className={styles.sectionTitle}>Coding activity</h2>
-            <div className={styles.rangeTabs}>
-              {ACTIVITY_RANGES.map((r) => (
-                <button
-                  key={r.key}
-                  type="button"
-                  className={`${styles.rangeTab} ${range === r.key ? styles.rangeTabOn : ""}`}
-                  onClick={() => setRange(r.key)}
-                >
-                  {r.label}
-                </button>
-              ))}
-            </div>
-          </div>
-          <ActivityChart points={data.activity} range={range} />
-        </div>
-
-        <div className={styles.card}>
-          <h2 className={styles.sectionTitle} style={{ marginBottom: 14 }}>
-            Difficulty distribution
-          </h2>
-          {difficulty.available && difficulty.total > 0 ? (
-            <>
-              <div className={styles.donutWrap}>
-                <div className={styles.donut}>
-                  <DifficultyDonut breakdown={difficulty} />
-                </div>
-                <div style={{ flex: "1 1 150px", minWidth: 0 }}>
-                  <DifficultyBars breakdown={difficulty} />
-                </div>
-              </div>
-            </>
-          ) : (
-            <div className={styles.empty}>
-              <strong>No difficulty data available.</strong>
-              <span>
-                Connect a platform that publishes problem difficulty (LeetCode or Codeforces) to see
-                this breakdown.
-              </span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* --------------------------- topic progress ------------------------ */}
-      <section className={styles.section}>
-        <div className={styles.sectionHead}>
-          <h2 className={styles.sectionTitle}>Topic progress</h2>
-          <Link href="/dashboard/topics" className={styles.sectionLink}>
-            View topics →
-          </Link>
-        </div>
-
-        {topicProgressHasData(orderedTopics) ? (
-          <div className={styles.card}>
-            <div className={styles.topicList}>
-              {orderedTopics.map((t) => (
-                <div key={t.topic} className={styles.topicRow}>
-                  <div className={styles.topicTop}>
-                    <span className={styles.topicName}>{t.topic}</span>
-                    <span className={styles.topicValue}>
-                      {t.solved}
-                      <span>
-                        /{t.total || 0}
-                        {"  "}
-                        {t.total > 0 ? `${Math.round((t.solved / t.total) * 100)}%` : "0%"}
-                      </span>
-                    </span>
-                  </div>
-                  <MiniBar value={t.solved} total={t.total} />
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className={styles.empty}>
-            <strong>No topic data yet.</strong>
-            <span>Track questions in the question tracker and progress will show up here.</span>
-            <Link href="/dashboard/tracker" className={styles.btnGhost} style={{ marginTop: 4 }}>
-              Open question tracker
+            <Link href="/dashboard/projects?new=1" className={styles.addCard}>
+              <span className={styles.addPlus}>+</span>
+              Add Project
             </Link>
           </div>
-        )}
-      </section>
-
-      {/* ------------------------ feed + sync status ----------------------- */}
-      <div className={styles.cols}>
-        <div className={styles.card}>
-          <h2 className={styles.sectionTitle} style={{ marginBottom: 6 }}>
-            Recent activity
-          </h2>
-          {events.length === 0 ? (
-            <p className={styles.hint} style={{ marginTop: 10 }}>
-              Nothing has happened yet. Solve a problem or sync a platform and your activity will
-              appear here.
-            </p>
-          ) : (
-            <ul className={styles.feed}>
-              {events.slice(0, 8).map((e) => (
-                <li key={e.id} className={styles.feedItem}>
-                  <span className={styles.feedIcon}>{eventGlyph(e.kind)}</span>
-                  <div className={styles.feedBody}>
-                    <span className={styles.feedTitle}>
-                      {e.href ? (
-                        <Link href={e.href} style={{ color: "inherit" }}>
-                          {e.title}
-                        </Link>
-                      ) : (
-                        e.title
-                      )}
-                    </span>
-                    <span className={styles.feedMeta}>
-                      {e.detail ? `${e.detail} · ` : ""}
-                      {relativeTime(e.occurredAt)}
-                    </span>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        <div className={styles.card}>
-          <div className={styles.sectionHead} style={{ marginBottom: 6 }}>
-            <h2 className={styles.sectionTitle}>Sync status</h2>
-            <Link href="/dashboard/platforms" className={styles.sectionLink}>
-              Manage →
-            </Link>
-          </div>
-          {connectedPlatforms.length === 0 ? (
-            <p className={styles.hint} style={{ marginTop: 10 }}>
-              No platforms connected.
-            </p>
-          ) : (
-            <ul className={styles.syncList}>
-              {connectedPlatforms.map((p) => {
-                const job = syncJobs.find((j) => j.platform === p.account.platform);
-                const state = job?.status === "failed" ? "failed" : p.account.syncStatus;
-                return (
-                  <li key={p.account.id} className={styles.syncRow}>
-                    <PlatformLogo platform={p.account.platform} size={22} />
-                    <span style={{ fontSize: 13, fontWeight: 600 }}>
-                      {p.meta.label}
-                    </span>
-                    <span className={styles.syncState} data-state={state}>
-                      {state === "failed" ? "⚠ " : state === "syncing" ? "⟳ " : state === "ok" ? "✓ " : ""}
-                      {SYNC_LABEL[state] ?? state}
-                      {state === "ok" && p.account.lastSyncedAt ? ` ${relativeTime(p.account.lastSyncedAt)}` : ""}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </div>
-      </div>
-
-      {/* ----------------------------- projects --------------------------- */}
-      <section className={styles.section}>
-        <div className={styles.sectionHead}>
-          <h2 className={styles.sectionTitle}>Recent projects</h2>
-          <Link href="/dashboard/projects" className={styles.sectionLink}>
-            View all →
-          </Link>
-        </div>
-
-        <div className={styles.projectGrid}>
-          {projects.slice(0, 3).map((p) => (
-            <ProjectCard key={p.id} project={p} />
-          ))}
-          <Link href="/dashboard/projects?new=1" className={styles.addCard}>
-            <span className={styles.addPlus}>+</span>
-            Add Project
-          </Link>
-        </div>
-      </section>
-
-      {/* --------------------------- achievements -------------------------- */}
-      <section className={styles.section}>
-        <div className={styles.sectionHead}>
-          <h2 className={styles.sectionTitle}>Achievements</h2>
-          <Link href="/dashboard/achievements" className={styles.sectionLink}>
-            View all achievements →
-          </Link>
-        </div>
-
-        {earned.length === 0 ? (
-          <div className={styles.empty}>
-            <strong>No achievements unlocked yet.</strong>
-            <span>Keep solving and syncing — badges are awarded automatically as you progress.</span>
-          </div>
-        ) : (
-          <div className={styles.achGrid}>
-            {earned.slice(0, 4).map((a) => (
-              <div key={a.code} className={styles.achCard} data-earned="true">
-                <span className={styles.achGlyph}>{a.icon || "★"}</span>
-                <span className={styles.achName}>{a.title}</span>
-                <span className={styles.achDesc}>{a.description}</span>
-                <span className={styles.achDate}>Unlocked {relativeTime(a.unlockedAt)}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+        </section>
+      )}
     </div>
   );
 }
 
 /* ============================ sub components ============================== */
+
+function NewUserPanel() {
+  return (
+    <section className={styles.section}>
+      <div className={styles.card}>
+        <h2 className={styles.sectionTitle}>Welcome to Devora 🚀</h2>
+        <p className={styles.hint} style={{ marginTop: 8 }}>
+          Your coding journey starts here.
+        </p>
+        <p className={styles.hint} style={{ marginTop: 14 }}>
+          Connect your coding platforms to start tracking:
+        </p>
+        <ul className={styles.bulletList}>
+          <li>Problems</li>
+          <li>Streaks</li>
+          <li>Activity</li>
+          <li>Progress</li>
+        </ul>
+        <div className={styles.heroActions} style={{ marginTop: 18 }}>
+          <Link href="/dashboard/platforms" className={styles.btnPrimary}>
+            Connect Platform
+          </Link>
+          <Link href="/dashboard/platforms" className={styles.btnGhost}>
+            Connect GitHub
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RangeTabs({
+  options,
+  value,
+  onChange,
+}: {
+  options: { key: string; label: string }[];
+  value: string;
+  onChange: (key: string) => void;
+}) {
+  return (
+    <div className={styles.rangeTabs}>
+      {options.map((o) => (
+        <button
+          key={o.key}
+          type="button"
+          className={`${styles.rangeTab} ${value === o.key ? styles.rangeTabOn : ""}`}
+          onClick={() => onChange(o.key)}
+          aria-pressed={value === o.key}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 function StatCard({
   label,
@@ -456,16 +960,74 @@ function StatCard({
         {label}
       </div>
       <div className={styles.statValue} data-empty={empty}>
-        {empty ? "—" : `${value!.toLocaleString()}${suffix ?? ""}`}
+        {empty ? "—" : `${value.toLocaleString()}${suffix ?? ""}`}
       </div>
       <div className={styles.statNote}>{note}</div>
     </div>
   );
 }
 
-function PlatformStatCard({ platform }: { platform: ConnectedPlatform }) {
+function MiniStat({
+  label,
+  value,
+  suffix = "",
+}: {
+  label: string;
+  value: number;
+  suffix?: string;
+}) {
+  return (
+    <div className={styles.miniStat}>
+      <div className={styles.miniStatValue}>
+        {value.toLocaleString()}
+        {suffix}
+      </div>
+      <div className={styles.miniStatLabel}>{label}</div>
+    </div>
+  );
+}
+
+function Highlight({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string | null;
+  sub?: string;
+}) {
+  return (
+    <div className={styles.highlight}>
+      <div className={styles.highlightLabel}>{label}</div>
+      <div className={styles.highlightValue} data-empty={value == null}>
+        {value ?? "—"}
+      </div>
+      {sub && <div className={styles.highlightSub}>{sub}</div>}
+    </div>
+  );
+}
+
+function MetaCell({ label, value }: { label: string; value: number | null }) {
+  return (
+    <div className={styles.metaCell}>
+      <div className={styles.metaLabel}>{label}</div>
+      <div className={styles.metaValue} data-empty={value == null}>
+        {value == null ? "—" : value.toLocaleString()}
+      </div>
+    </div>
+  );
+}
+
+function PlatformStatCard({
+  platform,
+  syncJob,
+}: {
+  platform: ConnectedPlatform;
+  syncJob?: DashboardPayload["syncJobs"][number];
+}) {
   const { account, stats, meta } = platform;
   const rows = buildMetricRows(platform);
+  const state = syncJob?.status === "failed" ? "failed" : account.syncStatus;
 
   return (
     <div className={styles.platformCard}>
@@ -477,17 +1039,16 @@ function PlatformStatCard({ platform }: { platform: ConnectedPlatform }) {
         </div>
         <span
           className={styles.pill}
-          data-tone={account.syncStatus === "ok" ? "ok" : account.syncStatus === "failed" ? "bad" : "accent"}
+          data-tone={state === "ok" ? "ok" : state === "failed" ? "bad" : "accent"}
           style={{ marginLeft: "auto" }}
         >
-          {account.syncStatus === "ok" ? "✓ Synced" : account.syncStatus === "failed" ? "⚠ Failed" : "⟳ Syncing"}
+          {state === "ok" ? "✓ Connected" : state === "failed" ? "⚠ Sync failed" : "⟳ Syncing"}
         </span>
       </div>
 
       {rows.length === 0 ? (
         <p className={styles.hint}>
-          This platform does not publish additional metrics yet.{" "}
-          {stats?.fetchedAt ? `Last synced ${relativeTime(stats.fetchedAt)}.` : ""}
+          This platform does not publish additional metrics yet.
         </p>
       ) : (
         <div className={styles.platformMetrics}>
@@ -501,6 +1062,24 @@ function PlatformStatCard({ platform }: { platform: ConnectedPlatform }) {
           ))}
         </div>
       )}
+
+      <div className={styles.metaFoot}>
+        <span className={styles.hint}>
+          {account.lastSyncedAt
+            ? `Last synced ${relativeTime(account.lastSyncedAt)}`
+            : "Not synced yet"}
+        </span>
+        {account.profileUrl && (
+          <a
+            href={account.profileUrl}
+            target="_blank"
+            rel="noreferrer"
+            className={styles.projectLink}
+          >
+            Profile ↗
+          </a>
+        )}
+      </div>
     </div>
   );
 }
@@ -519,23 +1098,31 @@ function buildMetricRows({
   switch (account.platform) {
     case "leetcode":
       push("Solved", stats.solvedTotal);
+      push("Easy", stats.solvedEasy);
+      push("Medium", stats.solvedMedium);
+      push("Hard", stats.solvedHard);
       push("Rating", stats.rating ? Math.round(stats.rating) : null);
       push("Streak", stats.streakCurrent);
       push("Badges", stats.badges);
       break;
     case "codechef":
       push("Solved", stats.solvedTotal);
+      push("Easy", stats.solvedEasy);
+      push("Medium", stats.solvedMedium);
+      push("Hard", stats.solvedHard);
       push("Rating", stats.rating ? Math.round(stats.rating) : null);
       push("Contests", stats.contests);
       if (stats.rankLabel) rows.push({ label: "Stars", value: 0, display: stats.rankLabel });
       break;
-    case "codeforces": {
+    case "codeforces":
       push("Solved", stats.solvedTotal);
+      push("Easy", stats.solvedEasy);
+      push("Medium", stats.solvedMedium);
+      push("Hard", stats.solvedHard);
       push("Rating", stats.rating ? Math.round(stats.rating) : null);
       push("Max rating", stats.maxRating ? Math.round(stats.maxRating) : null);
       push("Contests", stats.contests);
       break;
-    }
     case "gfg":
       push("Solved", stats.solvedTotal);
       push("Score", stats.reputation);
@@ -556,10 +1143,7 @@ function buildMetricRows({
   return rows;
 }
 
-function ProjectCard({  project,
-}: {
-  project: DashboardPayload["projects"][number];
-}) {
+function ProjectCard({ project }: { project: DashboardPayload["projects"][number] }) {
   return (
     <article className={styles.projectCard}>
       <div className={styles.projectThumb}>
@@ -567,7 +1151,9 @@ function ProjectCard({  project,
           // eslint-disable-next-line @next/next/no-img-element
           <img src={project.imageUrl} alt="" />
         ) : (
-          <span className={styles.projectThumbFallback}>{project.name.slice(0, 2).toUpperCase()}</span>
+          <span className={styles.projectThumbFallback}>
+            {project.name.slice(0, 2).toUpperCase()}
+          </span>
         )}
       </div>
       <div className={styles.projectBody}>
@@ -626,8 +1212,8 @@ function DashboardSkeleton() {
   return (
     <div>
       <div className={styles.skeleton} style={{ height: 128, borderRadius: 16 }} />
-      <div className={styles.statGrid}>
-        {[0, 1, 2, 3].map((i) => (
+      <div className={styles.statGrid5}>
+        {[0, 1, 2, 3, 4].map((i) => (
           <div key={i} className={styles.skeleton} style={{ height: 108 }} />
         ))}
       </div>
@@ -641,8 +1227,11 @@ function DashboardSkeleton() {
 
 /* ================================ helpers ================================= */
 
-function topicProgressHasData(rows: { solved: number; total: number }[]): boolean {
-  return rows.some((r) => r.solved > 0 || r.total > 0);
+/** Charts get denser as the window grows, so pick a readable bucket size. */
+function autoGranularity(range: ProblemsRange): GraphGranularity {
+  if (range === "7d" || range === "30d") return "daily";
+  if (range === "3m" || range === "6m") return "weekly";
+  return "monthly";
 }
 
 function greetingFor(date: Date): string {
@@ -666,6 +1255,34 @@ function relativeTime(iso: string): string {
   if (d === 1) return "yesterday";
   if (d < 30) return `${d} days ago`;
   return new Date(iso).toLocaleDateString();
+}
+
+function formatLongDay(day: string): string {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+function formatShortDay(day: string): string {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function initialsOf(name: string): string {
+  return (
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase())
+      .join("") || "D"
+  );
 }
 
 function eventGlyph(kind: string): string {
@@ -725,10 +1342,19 @@ function TrophyGlyph() {
   );
 }
 
-function GitHubGlyph() {
+function CalendarGlyph() {
   return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
-      <path d="M12 .5A11.5 11.5 0 00.5 12a11.5 11.5 0 007.86 10.92c.58.1.79-.25.79-.55v-1.93c-3.2.7-3.88-1.54-3.88-1.54-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 015.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.81 1.18 1.84 1.18 3.1 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .3.21.66.8.55A11.5 11.5 0 0023.5 12 11.5 11.5 0 0012 .5z" />
+    <svg {...GLYPH_PROPS}>
+      <rect x="3" y="4" width="18" height="18" rx="2" />
+      <path d="M16 2v4M8 2v4M3 10h18" />
+    </svg>
+  );
+}
+
+function LinkGlyph() {
+  return (
+    <svg {...GLYPH_PROPS}>
+      <path d="M10 13a5 5 0 007.5.5l3-3a5 5 0 00-7-7l-1.8 1.8M14 11a5 5 0 00-7.5-.5l-3 3a5 5 0 007 7l1.8-1.8" />
     </svg>
   );
 }

@@ -10,9 +10,19 @@
     "typecheck": "tsc --noEmit",
     "verify:logic": "tsx scripts/verify-logic.ts",
     "verify:schema": "tsx scripts/verify-schema.ts",
-    "verify": "npm run typecheck && npm run verify:logic && npm run verify:schema"
+    "verify": "npm run typecheck && npm run verify:logic && npm run verify:schema",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:seed": "prisma db seed",
+    "db:studio": "prisma studio",
+    "verify:db": "tsx scripts/verify-db.ts",
+    "verify:platforms": "node --conditions=react-server --import tsx scripts/verify-platforms.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
+    "@prisma/client": "6.19.3",
     "@react-three/drei": "^10.7.8",
     "@react-three/fiber": "^9.7.0",
     "@supabase/ssr": "^0.12.7",
@@ -35,6 +45,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.5",
+    "prisma": "6.19.3",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
     "typescript": "^5"

@@ -10,7 +10,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
-import { TOPIC_ORDER } from "@/lib/types";
+import { TOPIC_ORDER, type DifficultyBreakdown } from "@/lib/types";
+import { DifficultyBars } from "@/components/dashboard/charts";
 import styles from "@/app/dashboard/dashboard.module.css";
 
 type TrackerQuestion = {
@@ -30,6 +31,23 @@ const DIFFICULTY_TONE: Record<string, "ok" | "warn" | "bad"> = {
   Hard: "bad",
 };
 
+/**
+ * Company-wise question sheets.
+ *
+ * Deliberately a placeholder: these sets are owned by the admin panel that is
+ * not built yet, so every company reads "Coming soon" instead of showing an
+ * invented question count. When the admin panel lands, replace this static
+ * list with the real rows and drop the badge.
+ */
+const COMPANY_SHEETS = [
+  { name: "Amazon", note: "SDE + DSA question set" },
+  { name: "Google", note: "Interview question set" },
+  { name: "Microsoft", note: "SDE question set" },
+  { name: "Flipkart", note: "SDE question set" },
+  { name: "Adobe", note: "DSA question set" },
+  { name: "Goldman Sachs", note: "Interview question set" },
+];
+
 export function TrackerView() {
   const [questions, setQuestions] = useState<TrackerQuestion[]>([]);
   const [loading, setLoading] = useState(true);
@@ -37,6 +55,7 @@ export function TrackerView() {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [breakdown, setBreakdown] = useState<DifficultyBreakdown | null>(null);
 
   // add form
   const [adding, setAdding] = useState(false);
@@ -49,11 +68,13 @@ export function TrackerView() {
     const params = new URLSearchParams();
     if (search.trim()) params.set("search", search.trim());
     if (status) params.set("status", status);
-    const res = await apiFetch<{ questions: TrackerQuestion[] }>(
-      `/api/tracker?${params.toString()}`
-    );
+    const res = await apiFetch<{
+      questions: TrackerQuestion[];
+      breakdown?: DifficultyBreakdown;
+    }>(`/api/tracker?${params.toString()}`);
     if (res.ok) {
       setQuestions(res.data.questions);
+      setBreakdown(res.data.breakdown ?? null);
       setError(null);
     } else {
       setError(res.error);
@@ -231,6 +252,16 @@ export function TrackerView() {
         </span>
       </div>
 
+      {breakdown && breakdown.available && (
+        <div className={styles.card} style={{ marginBottom: 16 }}>
+          <div className={styles.chartHead} style={{ marginBottom: 12 }}>
+            <span>Solved by difficulty</span>
+            <span className={styles.hint}>{breakdown.total} solved</span>
+          </div>
+          <DifficultyBars breakdown={breakdown} />
+        </div>
+      )}
+
       {loading ? (
         <div className={styles.skeleton} style={{ height: 320 }} />
       ) : questions.length === 0 ? (
@@ -283,6 +314,33 @@ export function TrackerView() {
           ))}
         </div>
       )}
+
+      <div className={styles.sectionHead} style={{ marginTop: 30, marginBottom: 14 }}>
+        <div>
+          <h2 className={styles.pageTitle} style={{ fontSize: 19, marginBottom: 4 }}>
+            Company-wise Question Sheets
+          </h2>
+          <p className={styles.pageSub}>
+            Curated question sets per company. These will be published from the
+            Devora admin panel.
+          </p>
+        </div>
+        <span className={styles.pill} data-tone="accent">
+          Coming soon
+        </span>
+      </div>
+
+      <div className={styles.platformGrid}>
+        {COMPANY_SHEETS.map((company) => (
+          <div key={company.name} className={styles.platformCard}>
+            <strong>{company.name}</strong>
+            <span className={styles.pageSub}>{company.note}</span>
+            <span className={styles.pill} data-tone="warn">
+              Coming soon
+            </span>
+          </div>
+        ))}
+      </div>
     </>
   );
 }

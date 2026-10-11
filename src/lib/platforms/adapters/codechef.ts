@@ -1,17 +1,28 @@
 /**
- * CodeChef adapter — public JSON endpoints that codechef.com itself uses to
- * render a user's public profile.
+ * CodeChef adapter.
  *
- * No login is performed, no Cloudflare/anti-bot protection is circumvented,
- * and requests are cached. If CodeChef declines the request, the adapter
- * reports the failure honestly instead of inventing statistics.
+ * What CodeChef actually publishes (verified against the live site):
+ *   - `GET /users/{handle}` returns the profile PAGE as HTML (200). There is no
+ *     JSON profile API — the previous version of this adapter asked for
+ *     `application/json` on this very URL, so `response.json()` always threw
+ *     and a real, existing profile was reported as unverifiable.
+ *   - A missing handle is answered with a 302 to the site home page, not a 404,
+ *     so the final URL — not the status code — is what proves existence.
+ *   - The page embeds `var all_rating = [...]`: the user's real contest history
+ *     with rating, rank, name and date per contest.
+ *   - `…/rating_data` is gone (404), so it is no longer requested.
+ *
+ * No login is performed, no anti-bot protection is circumvented, requests are
+ * cached, and every figure stored comes from the embedded contest history.
  */
 
 import type { PlatformKey } from "@/lib/validation";
 import type { NormalizedStats } from "@/lib/db/repository";
 import {
   PlatformError,
-  platformFetch,
+  platformFetchDocument,
+  classifyVerifyFailure,
+  verifiedResult,
   currentStreakFromDays,
   longestStreakFromDays,
   type AdapterActivity,
@@ -22,23 +33,9 @@ import {
   type SyncContext,
 } from "@/lib/platforms/types";
 
-type CodeChefProfile = {
-  name?: string;
-  username?: string;
-  profile?: string;
-  image?: string;
-  ratingNumber?: number;
-  stars?: string;
-  highestRating?: number;
-  globalRank?: number;
-  countryRank?: number;
-  countryCode?: string;
-  occupation?: string;
-  studentOrProfessional?: string;
-  institution?: string;
-};
+const BASE = "https://www.codechef.com";
 
-type CodeChefRatingHistory = {
+type CodeChefRatingEntry = {
   code?: string;
   getyear?: string;
   getmonth?: string;
@@ -46,93 +43,160 @@ type CodeChefRatingHistory = {
   rating?: string;
   rank?: string;
   name?: string;
+  end_date?: string;
 };
 
-async function fetchProfile(username: string): Promise<CodeChefProfile> {
+const PROFILE_PATH = (username: string) => `/users/${encodeURIComponent(username)}`;
+
+/**
+ * Fetch the profile page and decide whether it really is that user's profile.
+ *
+ * Two signals are required together, because neither is sufficient on its own:
+ * the final URL must still be `/users/{handle}` (a missing handle bounces to
+ * `/`), and the document must carry the profile's own rating block.
+ */
+async function fetchProfileDocument(username: string): Promise<{
+  html: string;
+  canonicalUsername: string;
+}> {
+  const doc = await platformFetchDocument(`${BASE}${PROFILE_PATH(username)}`, {
+    revalidate: 900,
+    timeoutMs: 12_000,
+  });
+
+  let finalPath = "";
   try {
-    const data = await platformFetch<CodeChefProfile>(
-      `https://www.codechef.com/users/${encodeURIComponent(username)}`,
-      {
-        headers: { Accept: "application/json" },
-        revalidate: 900,
-        timeoutMs: 12_000,
-      }
-    );
-    if (!data || (!data.username && !data.name)) {
-      throw new PlatformError("not_found", "No CodeChef profile with that username.");
-    }
-    return data;
-  } catch (error) {
-    if (error instanceof PlatformError && error.reason === "upstream_error") {
-      // CodeChef serves HTML to non-browser clients; that is not a user error.
-      throw new PlatformError(
-        "unsupported",
-        "CodeChef did not return profile data for that username."
-      );
-    }
-    throw error;
+    finalPath = new URL(doc.finalUrl).pathname;
+  } catch {
+    finalPath = "";
   }
+
+  const segments = finalPath.split("/").filter(Boolean);
+  const onProfile = segments.length === 2 && segments[0].toLowerCase() === "users";
+  const finalHandle = onProfile ? decodeURIComponent(segments[1]) : "";
+  const sameUser =
+    finalHandle.length > 0 &&
+    finalHandle.toLowerCase() === username.toLowerCase();
+
+  if (!sameUser || !/all_rating\s*=/.test(doc.html)) {
+    throw new PlatformError(
+      "not_found",
+      "No CodeChef profile with that username."
+    );
+  }
+
+  return { html: doc.html, canonicalUsername: finalHandle };
 }
 
-async function fetchRatingHistory(username: string): Promise<CodeChefRatingHistory[]> {
+/** The page's own embedded contest history. */
+function parseRatingHistory(html: string): CodeChefRatingEntry[] {
+  const match = /var\s+all_rating\s*=\s*(\[[\s\S]*?\]);/.exec(html);
+  if (!match) return [];
   try {
-    return await platformFetch<CodeChefRatingHistory[]>(
-      `https://www.codechef.com/users/${encodeURIComponent(username)}/rating_data`,
-      { revalidate: 900, timeoutMs: 12_000 }
-    );
+    const parsed = JSON.parse(match[1]) as CodeChefRatingEntry[];
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
 }
 
-function buildStats(
-  profile: CodeChefProfile,
-  history: CodeChefRatingHistory[]
-): NormalizedStats {
+/**
+ * CodeChef's published division bands. This is a deterministic function of the
+ * rating the platform itself reports — it is a label for a real number, not an
+ * invented statistic, and it stays null when there is no rating.
+ */
+function starLabel(rating: number | null): string | null {
+  if (rating === null) return null;
+  if (rating < 1400) return "1★";
+  if (rating < 1600) return "2★";
+  if (rating < 1800) return "3★";
+  if (rating < 2000) return "4★";
+  if (rating < 2200) return "5★";
+  if (rating < 2500) return "6★";
+  return "7★";
+}
+
+function numeric(value: unknown): number | null {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Newest last, so "current rating" is simply the final entry. */
+function chronological(history: CodeChefRatingEntry[]): CodeChefRatingEntry[] {
+  return [...history].sort((a, b) => {
+    const at = new Date(a.end_date ?? "").getTime() || 0;
+    const bt = new Date(b.end_date ?? "").getTime() || 0;
+    return at - bt;
+  });
+}
+
+function buildStats(history: CodeChefRatingEntry[]): NormalizedStats {
+  const ordered = chronological(history);
+  const ratings = ordered
+    .map((entry) => numeric(entry.rating))
+    .filter((v): v is number => v !== null);
+  const current = ratings.length > 0 ? ratings[ratings.length - 1] : null;
+
   return {
-    // CodeChef publishes a rating and a rank, not a solved count.
+    // CodeChef publishes a rating and a contest history, not a solved count —
+    // so solved stays null and the dashboard shows "—" rather than a guess.
     solvedTotal: null,
     solvedEasy: null,
     solvedMedium: null,
     solvedHard: null,
-    rating: profile.ratingNumber ?? null,
-    maxRating: profile.highestRating ?? null,
-    rankLabel: profile.stars ?? null,
-    contests: history.length > 0 ? history.length : null,
+    rating: current,
+    maxRating: ratings.length > 0 ? Math.max(...ratings) : null,
+    rankLabel: starLabel(current),
+    contests: ordered.length > 0 ? ordered.length : null,
     badges: null,
-    reputation: profile.globalRank ? -profile.globalRank : null, // rank, stored signed-safe
+    reputation: null,
     followers: null,
     publicRepos: null,
     contributions: null,
     streakCurrent: null,
     streakLongest: null,
     raw: {
-      globalRank: profile.globalRank ?? null,
-      countryRank: profile.countryRank ?? null,
-      stars: profile.stars ?? null,
+      source: "codechef-profile-page",
+      contests: ordered.length,
+      latestRank: numeric(ordered[ordered.length - 1]?.rank),
+      latestContest: ordered[ordered.length - 1]?.name ?? null,
     },
   };
 }
 
-function activityFromHistory(history: CodeChefRatingHistory[]): AdapterActivity | null {
+/** Real contest dates, so the activity heatmap reflects actual participation. */
+function activityFromHistory(history: CodeChefRatingEntry[]): AdapterActivity | null {
   const counts = new Map<string, number>();
   for (const entry of history) {
-    if (!entry.getyear || !entry.getmonth || !entry.getday) continue;
-    const day = `${entry.getyear}-${String(entry.getmonth).padStart(2, "0")}-${String(
-      entry.getday
-    ).padStart(2, "0")}`;
-    if (Number.isNaN(new Date(day).getTime())) continue;
+    let day: string | null = null;
+    if (entry.end_date) {
+      const parsed = new Date(entry.end_date.replace(" ", "T") + "Z");
+      if (!Number.isNaN(parsed.getTime())) day = parsed.toISOString().slice(0, 10);
+    }
+    if (!day && entry.getyear && entry.getmonth && entry.getday) {
+      day = `${entry.getyear}-${String(entry.getmonth).padStart(2, "0")}-${String(
+        entry.getday
+      ).padStart(2, "0")}`;
+    }
+    if (!day) continue;
     counts.set(day, (counts.get(day) ?? 0) + 1);
   }
   if (counts.size === 0) return null;
+
   const days = [...counts.entries()]
     .map(([day, count]) => ({ day, count }))
     .sort((a, b) => a.day.localeCompare(b.day));
+
   return {
     days,
     currentStreak: currentStreakFromDays(days),
     longestStreak: longestStreakFromDays(days),
   };
+}
+
+async function load(username: string) {
+  const { html, canonicalUsername } = await fetchProfileDocument(username);
+  return { history: parseRatingHistory(html), canonicalUsername };
 }
 
 export const codechefAdapter: PlatformAdapter = {
@@ -147,73 +211,66 @@ export const codechefAdapter: PlatformAdapter = {
 
   async verify(username: string) {
     try {
-      const profile = await fetchProfile(username);
-      return { exists: true, message: `@${profile.username ?? username}` };
+      const { history, canonicalUsername } = await load(username);
+      return verifiedResult({
+        username: canonicalUsername,
+        profileUrl: `${BASE}/users/${canonicalUsername}`,
+        message: history.length > 0
+          ? `@${canonicalUsername} · ${history.length} rated contests`
+          : `@${canonicalUsername}`,
+        statsAvailable: true,
+      });
     } catch (error) {
-      if (error instanceof PlatformError && error.reason === "not_found") {
-        return { exists: false, message: "No CodeChef profile with that username." };
-      }
-      if (
-        error instanceof PlatformError &&
-        (error.reason === "rate_limited" || error.reason === "unsupported")
-      ) {
-        return { exists: false, message: "CodeChef check unavailable right now." };
-      }
-      throw error;
+      return classifyVerifyFailure(error, {
+        statsAvailable: true,
+        fallbackUsername: username,
+      });
     }
   },
 
   async fetchProfile(username: string): Promise<AdapterIdentity | null> {
-    const profile = await fetchProfile(username);
+    const { canonicalUsername } = await load(username);
     return {
-      username: profile.username ?? username,
+      username: canonicalUsername,
       externalUserId: null,
-      profileUrl: `https://www.codechef.com/users/${profile.username ?? username}`,
-      avatarUrl: profile.image ?? null,
+      profileUrl: `${BASE}/users/${canonicalUsername}`,
+      avatarUrl: null,
     };
   },
 
   async fetchStats(username: string): Promise<NormalizedStats> {
-    const [profile, history] = await Promise.all([
-      fetchProfile(username),
-      fetchRatingHistory(username),
-    ]);
-    return buildStats(profile, history);
+    return buildStats((await load(username)).history);
   },
 
   async fetchActivity(username: string): Promise<AdapterActivity | null> {
-    return activityFromHistory(await fetchRatingHistory(username));
+    return activityFromHistory((await load(username)).history);
   },
 
   normalize(raw: unknown, _identity: AdapterIdentity): NormalizedStats {
-    const payload = raw as {
-      profile: CodeChefProfile;
-      history: CodeChefRatingHistory[];
-    };
-    return buildStats(payload.profile, payload.history);
+    return buildStats((raw as CodeChefRatingEntry[]) ?? []);
   },
 
   async sync(ctx: SyncContext): Promise<NormalizedSyncResult> {
-    const [profile, history] = await Promise.all([
-      fetchProfile(ctx.username),
-      fetchRatingHistory(ctx.username),
-    ]);
+    const { history, canonicalUsername } = await load(ctx.username);
+    const stats = buildStats(history);
 
     return {
       identity: {
-        username: profile.username ?? ctx.username,
+        username: canonicalUsername,
         externalUserId: null,
-        profileUrl: `https://www.codechef.com/users/${profile.username ?? ctx.username}`,
-        avatarUrl: profile.image ?? null,
+        profileUrl: `${BASE}/users/${canonicalUsername}`,
+        avatarUrl: null,
       },
-      stats: buildStats(profile, history),
+      stats,
       activity: activityFromHistory(history),
       events: [
         {
           kind: "platform_sync",
           title: "CodeChef synchronized",
-          detail: profile.stars ? `${profile.stars} · ${profile.ratingNumber ?? "unrated"}` : undefined,
-          href: `https://www.codechef.com/users/${profile.username ?? ctx.username}`,
+          detail: stats.rating
+            ? `${stats.rankLabel ?? "rated"} · ${stats.rating} rating`
+            : `${history.length} rated contests`,
+          href: `${BASE}/users/${canonicalUsername}`,
         },
       ],
     };

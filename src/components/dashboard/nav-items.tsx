@@ -12,7 +12,6 @@ export type NavId =
   | "profile"
   | "tracker"
   | "topics"
-  | "sheets"
   | "projects"
   | "analytics"
   | "achievements"
@@ -65,13 +64,6 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/dashboard/topics",
     group: "main",
     icon: <Icon d="M4 5h16M4 12h16M4 19h10" />,
-  },
-  {
-    id: "sheets",
-    label: "Coding Sheets",
-    href: "/dashboard/sheets",
-    group: "main",
-    icon: <Icon d="M4 4h16v16H4zM4 9h16M9 9v11" />,
   },
   {
     id: "projects",

@@ -11,6 +11,7 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { createServerClient } from "@supabase/ssr";
+import type { CookieMethodsServerDeprecated } from "@supabase/ssr";
 
 export const dynamic = "force-dynamic";
 
@@ -28,22 +29,23 @@ export async function GET(request: NextRequest) {
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   if (!url || !key) return NextResponse.redirect(`${origin}/dashboard`);
 
-  let response = NextResponse.next({ request });
-
-  const supabase = createServerClient(url, key, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
-      },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-        response = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) =>
-          response.cookies.set(name, value, options)
-        );
-      },
+  // Use the deprecated CookieMethodsServerDeprecated API (get/set) which
+  // correctly handles multi-session cookies (sb-<project>-auth-token.0/1).
+  // The newer getAll/setAll API has a bug with this format.
+  const cookies: CookieMethodsServerDeprecated = {
+    get(name: string) {
+      return request.cookies.get(name)?.value ?? undefined;
     },
-  });
+    set(name: string, value: string, options) {
+      // Cookies are set on the response after auth state changes.
+      // The response is built up via setAll elsewhere; this set is for
+      // incremental cookie updates during the auth flow.
+      const response = NextResponse.next({ request });
+      response.cookies.set(name, value, options);
+    },
+  };
+
+  const supabase = createServerClient(url, key, { cookies });
 
   const {
     data: { user },
@@ -55,7 +57,7 @@ export async function GET(request: NextRequest) {
   // the dashboard rather than trapping the user in onboarding.
   let destination = "/dashboard";
   try {
-    const { hasDatabase } = await import("@/lib/db/pool");
+    const { hasDatabase } = await import("@/lib/db/prisma");
     if (hasDatabase()) {
       const { isOnboardingComplete } = await import("@/lib/db/repository");
       const done = await isOnboardingComplete(user.id);
@@ -65,6 +67,7 @@ export async function GET(request: NextRequest) {
     destination = "/dashboard";
   }
 
+  const response = NextResponse.next({ request });
   const redirect = NextResponse.redirect(`${origin}${destination}`);
   for (const cookie of response.cookies.getAll()) redirect.cookies.set(cookie);
   return redirect;

@@ -10,7 +10,7 @@
  */
 
 import { after } from "next/server";
-import { queryOne } from "@/lib/db/pool";
+import { prisma } from "@/lib/db/prisma";
 import {
   computeProfileCompletion,
   createNotification,
@@ -104,17 +104,15 @@ export async function POST() {
       }
     });
 
-    const platformCount = await queryOne<{ n: string }>(
-      `select count(*)::text as n from public.platform_accounts
-        where user_id = $1 and connection_status = 'connected'`,
-      [user.id]
-    );
+    const platformCount = await prisma.platformAccount.count({
+      where: { user_id: user.id, connection_status: "connected" },
+    });
 
     return okResponse({
       ok: true,
       onboardingCompleted: true,
       completion,
-      syncingPlatforms: Number(platformCount?.n ?? 0),
+      syncingPlatforms: platformCount,
     });
   } catch (error) {
     return errorResponse(error, "Could not finish onboarding.");

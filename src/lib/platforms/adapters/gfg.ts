@@ -1,18 +1,26 @@
 /**
- * GeeksforGeeks adapter — public profile endpoints used by gfg's own pages.
+ * GeeksforGeeks adapter — link-only, deliberately.
  *
- * GfG's public surface is thin and occasionally changes. This adapter reads
- * what is genuinely published (solved counts and coding score) and returns
- * null for anything it cannot source, so the dashboard shows "—" instead of a
- * number nobody can verify.
+ * Verified against the live site (August 2026):
+ *   - the public data endpoint this adapter used to call
+ *     (`/gfg-api/v2/profile/{handle}/userdata`) now returns 404;
+ *   - `/gfg-api/v2/profile/{handle}`, `/api/user/{handle}` and the
+ *     practiceapi equivalents also return 404;
+ *   - `/profile/{handle}` returns 200 for a real handle AND for a handle that
+ *     does not exist (the page is a client-rendered shell that is byte-for-byte
+ *     the same length either way), so it cannot prove existence.
+ *
+ * There is therefore no permitted source that can confirm a GfG handle, and
+ * inventing one is exactly what the PRD forbids. The honest behaviour is to
+ * let the user keep their GfG profile as a saved link, marked unverified, and
+ * to never claim their GfG statistics were imported.
  */
 
 import type { PlatformKey } from "@/lib/validation";
 import type { NormalizedStats } from "@/lib/db/repository";
+import type { PlatformVerifyResult } from "@/lib/types";
 import {
   PlatformError,
-  platformFetch,
-  platformFetchText,
   type AdapterActivity,
   type AdapterIdentity,
   type ConnectContext,
@@ -23,202 +31,89 @@ import {
 
 const BASE = "https://www.geeksforgeeks.org";
 
-type GfgApiResponse = {
-  // Shape varies; only these keys are relied upon, and every one is optional.
-  data?: Record<string, unknown>;
-  userHandle?: string;
-  handle?: string;
-  userName?: string;
-  totalProblemsSolved?: number;
-  total_problems_solved?: number;
-  easy?: number;
-  medium?: number;
-  hard?: number;
-  codingScore?: number;
-  coding_score?: number;
-  instituteRank?: number;
-  institute_rank?: number;
-  currentStreak?: number;
-  current_streak?: number;
-  maxStreak?: number;
-  longest_streak?: number;
-  [key: string]: unknown;
+const PROFILE_URL = (username: string) => `${BASE}/profile/${encodeURIComponent(username)}`;
+
+const NO_PUBLIC_SOURCE =
+  "GeeksforGeeks does not publish a public statistics API, so Devora cannot verify this account. Your profile link can be saved and shown, but no figures will be imported.";
+
+const LINK_ONLY_VERIFICATION: PlatformVerifyResult = {
+  outcome: "VERIFICATION_UNAVAILABLE",
+  exists: false,
+  message: NO_PUBLIC_SOURCE,
+  username: null,
+  profileUrl: null,
+  statsAvailable: false,
+  canSaveLink: true,
 };
 
-function pickNumber(source: Record<string, unknown>, keys: string[]): number | null {
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string" && value.trim() !== "" && !Number.isNaN(Number(value))) {
-      return Number(value);
-    }
-  }
-  return null;
-}
-
-async function fetchProfile(username: string): Promise<GfgApiResponse> {
-  try {
-    const data = await platformFetch<GfgApiResponse>(
-      `${BASE}/gfg-api/v2/profile/${encodeURIComponent(username)}/userdata`,
-      { revalidate: 900, timeoutMs: 12_000 }
-    );
-    const payload =
-      data.data && typeof data.data === "object"
-        ? (data.data as Record<string, unknown>)
-        : (data as Record<string, unknown>);
-    if (!payload || Object.keys(payload).length === 0) {
-      throw new PlatformError("not_found", "No GeeksforGeeks profile with that username.");
-    }
-    return payload as GfgApiResponse;
-  } catch (error) {
-    if (error instanceof PlatformError && error.reason === "not_found") throw error;
-    if (error instanceof PlatformError && error.reason === "upstream_error") {
-      throw new PlatformError(
-        "unsupported",
-        "GeeksforGeeks did not return profile data for that username."
-      );
-    }
-    throw error;
-  }
-}
-
-function buildStats(profile: GfgApiResponse): NormalizedStats {
-  const flat = profile as unknown as Record<string, unknown>;
-  const easy = pickNumber(flat, ["easy", "easyProblemsSolved", "easy_problems_solved"]);
-  const medium = pickNumber(flat, ["medium", "mediumProblemsSolved", "medium_problems_solved"]);
-  const hard = pickNumber(flat, ["hard", "hardProblemsSolved", "hard_problems_solved"]);
-
-  const solved =
-    pickNumber(flat, [
-      "totalProblemsSolved",
-      "total_problems_solved",
-      "problemsSolved",
-      "solved",
-    ]) ?? (easy != null || medium != null || hard != null
-      ? (easy ?? 0) + (medium ?? 0) + (hard ?? 0)
-      : null);
-
+function identityFrom(username: string): AdapterIdentity {
   return {
-    solvedTotal: solved,
-    solvedEasy: easy,
-    solvedMedium: medium,
-    solvedHard: hard,
-    rating: null,
-    maxRating: null,
-    rankLabel:
-      pickNumber(flat, ["instituteRank", "institute_rank"]) != null
-        ? `Institute rank #${pickNumber(flat, ["instituteRank", "institute_rank"])}`
-        : null,
-    contests: null,
-    badges: null,
-    reputation: pickNumber(flat, ["codingScore", "coding_score"]),
-    followers: null,
-    publicRepos: null,
-    contributions: null,
-    streakCurrent: pickNumber(flat, ["currentStreak", "current_streak"]),
-    streakLongest: pickNumber(flat, ["maxStreak", "longest_streak"]),
-    raw: { source: "gfg-public-profile" },
+    username,
+    externalUserId: null,
+    profileUrl: PROFILE_URL(username),
+    avatarUrl: null,
   };
 }
 
-/** The public profile page carries a small submission heat map. */
-async function fetchActivity(username: string): Promise<AdapterActivity | null> {
-  try {
-    const html = await platformFetchText(
-      `${BASE}/user/${encodeURIComponent(username)}/`,
-      { revalidate: 900, timeoutMs: 12_000 }
-    );
-    const days: { day: string; count: number }[] = [];
-    const pattern = /data-date="(\d{4}-\d{2}-\d{2})"[^>]*data-count="(\d+)"/g;
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(html)) !== null) {
-      days.push({ day: match[1], count: Number(match[2]) });
-    }
-    if (days.length === 0) return null;
-    days.sort((a, b) => a.day.localeCompare(b.day));
-    return { days, currentStreak: null, longestStreak: null };
-  } catch {
-    // No published heat map is not an error condition.
-    return null;
-  }
-}
+/** No figure can be sourced, so every one of them stays null. */
+const EMPTY_STATS: NormalizedStats = {
+  solvedTotal: null,
+  solvedEasy: null,
+  solvedMedium: null,
+  solvedHard: null,
+  rating: null,
+  maxRating: null,
+  rankLabel: null,
+  contests: null,
+  badges: null,
+  reputation: null,
+  followers: null,
+  publicRepos: null,
+  contributions: null,
+  streakCurrent: null,
+  streakLongest: null,
+  raw: { source: "gfg-link-only", reason: "no-public-statistics-source" },
+};
 
 export const gfgAdapter: PlatformAdapter = {
   key: "gfg" as PlatformKey,
   label: "GeeksforGeeks",
   authType: "public",
 
-  async connect(ctx: ConnectContext): Promise<AdapterIdentity | null> {
-    if (!ctx.username) return null;
-    await fetchProfile(ctx.username);
-    return {
-      username: ctx.username,
-      externalUserId: null,
-      profileUrl: `${BASE}/user/${ctx.username}/`,
-      avatarUrl: null,
-    };
+  async verify(): Promise<PlatformVerifyResult> {
+    // A fresh object every call: callers fill in `username`/`profileUrl`, and
+    // handing out a shared constant would let one request's handle leak into
+    // the next one's response.
+    return { ...LINK_ONLY_VERIFICATION };
   },
 
-  async verify(username: string) {
-    try {
-      await fetchProfile(username);
-      return { exists: true, message: `@${username}` };
-    } catch (error) {
-      if (error instanceof PlatformError && error.reason === "not_found") {
-        return { exists: false, message: "No GeeksforGeeks profile with that username." };
-      }
-      if (
-        error instanceof PlatformError &&
-        (error.reason === "rate_limited" || error.reason === "unsupported")
-      ) {
-        return { exists: false, message: "GeeksforGeeks check unavailable right now." };
-      }
-      throw error;
-    }
+  /**
+   * Build the identity from the handle alone. No request is made, because there
+   * is nothing to ask — the URL shape is public knowledge.
+   */
+  async connect(ctx: ConnectContext): Promise<AdapterIdentity | null> {
+    if (!ctx.username) return null;
+    return identityFrom(ctx.username);
   },
 
   async fetchProfile(username: string): Promise<AdapterIdentity | null> {
-    await fetchProfile(username);
-    return {
-      username,
-      externalUserId: null,
-      profileUrl: `${BASE}/user/${username}/`,
-      avatarUrl: null,
-    };
+    return identityFrom(username);
   },
 
-  async fetchStats(username: string): Promise<NormalizedStats> {
-    return buildStats(await fetchProfile(username));
+  async fetchStats(): Promise<NormalizedStats> {
+    throw new PlatformError("unsupported", NO_PUBLIC_SOURCE);
   },
 
-  async fetchActivity(username: string): Promise<AdapterActivity | null> {
-    return fetchActivity(username);
+  async fetchActivity(): Promise<AdapterActivity | null> {
+    // GfG publishes no per-day submission history; null keeps the chart honest.
+    return null;
   },
 
-  normalize(raw: unknown, _identity: AdapterIdentity): NormalizedStats {
-    return buildStats(raw as GfgApiResponse);
+  normalize(): NormalizedStats {
+    return EMPTY_STATS;
   },
 
-  async sync(ctx: SyncContext): Promise<NormalizedSyncResult> {
-    const profile = await fetchProfile(ctx.username);
-    const stats = buildStats(profile);
-    return {
-      identity: {
-        username: ctx.username,
-        externalUserId: null,
-        profileUrl: `${BASE}/user/${ctx.username}/`,
-        avatarUrl: null,
-      },
-      stats,
-      activity: await fetchActivity(ctx.username),
-      events: [
-        {
-          kind: "platform_sync",
-          title: "GeeksforGeeks synchronized",
-          detail: stats.solvedTotal != null ? `${stats.solvedTotal} problems solved` : undefined,
-          href: `${BASE}/user/${ctx.username}/`,
-        },
-      ],
-    };
+  async sync(_ctx: SyncContext): Promise<NormalizedSyncResult> {
+    throw new PlatformError("unsupported", NO_PUBLIC_SOURCE);
   },
 };

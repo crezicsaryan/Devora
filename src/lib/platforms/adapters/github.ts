@@ -15,6 +15,8 @@ import {
   PlatformError,
   platformFetch,
   platformFetchText,
+  classifyVerifyFailure,
+  verifiedResult,
   currentStreakFromDays,
   longestStreakFromDays,
   type AdapterActivity,
@@ -34,8 +36,18 @@ const API = "https://api.github.com";
 export const GITHUB_OAUTH_AUTHORIZE = "https://github.com/login/oauth/authorize";
 export const GITHUB_OAUTH_TOKEN = "https://github.com/login/oauth/access_token";
 
-/** Minimal scopes: read the profile and public repository data. */
-export const GITHUB_SCOPES = ["read:user", "public_repo"];
+/**
+ * Minimal scopes.
+ *
+ * `read:user` is all Devora needs: it reads the profile via /user and the
+ * public repositories via /user/repos and /users/{handle}/repos. Those
+ * endpoints serve public data to any valid token, so `public_repo` was
+ * dropped — it would have granted WRITE access to the user's public
+ * repositories for nothing. Reading private repositories is deliberately out
+ * of scope for a public portfolio; if it is ever wanted, it needs an explicit
+ * `repo` grant, which is a far broader permission and should be an opt-in.
+ */
+export const GITHUB_SCOPES = ["read:user"];
 
 export function githubOAuthConfigured(): boolean {
   return Boolean(
@@ -87,22 +99,42 @@ export async function exchangeCodeForToken(
     throw new PlatformError("auth_required", "GitHub authorization is not configured.");
   }
 
+  // Form-encoded body: that is the shape GitHub documents for this endpoint
+  // ("POST ... -d client_id=..."). Accept: application/json asks for a JSON
+  // reply, but the reply format is not guaranteed, so it is parsed defensively
+  // below — a form-encoded reply must not crash the callback.
   const response = await fetch(GITHUB_OAUTH_TOKEN, {
     method: "POST",
     headers: {
       Accept: "application/json",
-      "Content-Type": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
       "User-Agent": "Devora/1.0",
     },
-    body: JSON.stringify({
+    body: new URLSearchParams({
       client_id: clientId,
       client_secret: clientSecret,
       code,
       redirect_uri: redirectUri,
-    }),
+    }).toString(),
   });
 
-  const json = (await response.json()) as GithubTokenResponse;
+  const raw = await response.text();
+  let json: GithubTokenResponse;
+  try {
+    json = JSON.parse(raw) as GithubTokenResponse;
+  } catch {
+    // Form-encoded fallback: access_token=...&scope=...&token_type=bearer
+    const params = new URLSearchParams(raw);
+    json = {
+      access_token: params.get("access_token") ?? undefined,
+      refresh_token: params.get("refresh_token") ?? undefined,
+      scope: params.get("scope") ?? undefined,
+      token_type: params.get("token_type") ?? undefined,
+      error: params.get("error") ?? undefined,
+      error_description: params.get("error_description") ?? undefined,
+    };
+  }
+
   if (!response.ok || !json.access_token) {
     throw new PlatformError(
       "auth_required",
@@ -220,24 +252,52 @@ export const githubAdapter: PlatformAdapter = {
     return identityFrom(user);
   },
 
+  /**
+   * Basic public-profile check.
+   *
+   * GitHub's public API answers this without any token, so existence can be
+   * confirmed even when OAuth is not configured. Reading private data, or
+   * anything requiring the user's own grant, still needs the OAuth flow.
+   */
   async verify(username: string) {
     try {
-      // Public endpoint — no token needed, so this works during onboarding
-      // even before the user authorizes.
       const user = await platformFetch<GithubUser>(
         `${API}/users/${encodeURIComponent(username)}`,
         { revalidate: 300 }
       );
-      return { exists: true, message: `@${user.login}` };
+      return verifiedResult({
+        username: user.login,
+        profileUrl: user.html_url,
+        message: `@${user.login} · ${user.public_repos} public repositories`,
+        // Basic profile facts are available; contribution history needs the
+        // authorized flow, so this is deliberately not "full".
+        statsAvailable: true,
+      });
     } catch (error) {
-      if (error instanceof PlatformError && error.reason === "not_found") {
-        return { exists: false, message: "No GitHub account with that username." };
+      if (
+        error instanceof PlatformError &&
+        error.reason === "auth_required" &&
+        !githubOAuthConfigured()
+      ) {
+        // Anonymous GitHub API access was refused and we hold no credentials.
+        return {
+          outcome: "CONFIGURATION_ERROR",
+          exists: false,
+          message:
+            "GitHub authorization is required. Add GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET to devora/.env to enable it, or save your profile link instead.",
+          username,
+          profileUrl: `https://github.com/${username}`,
+          statsAvailable: false,
+          canSaveLink: true,
+          requiresOAuth: true,
+        };
       }
-      if (error instanceof PlatformError && error.reason === "rate_limited") {
-        // Never fake a result on rate limit — report honestly.
-        return { exists: false, message: "GitHub is rate limiting checks. Try again shortly." };
-      }
-      throw error;
+      return classifyVerifyFailure(error, {
+        statsAvailable: true,
+        fallbackUsername: username,
+        unavailableMessage:
+          "GitHub could not be reached for a profile check. You can still save your GitHub link.",
+      });
     }
   },
 
@@ -270,6 +330,29 @@ export const githubAdapter: PlatformAdapter = {
       contributions = activity.days.reduce((sum, d) => sum + d.count, 0);
     }
 
+    // Language histogram and star count come from the repositories the user
+    // actually owns. If the repositories endpoint fails we report nothing
+    // rather than guessing at a distribution.
+    let languages: { name: string; count: number }[] = [];
+    let stars: number | null = null;
+    try {
+      const repos = await fetchRepositories(username, ctx);
+      const histogram = new Map<string, number>();
+      let starSum = 0;
+      for (const repo of repos) {
+        if (repo.language) {
+          histogram.set(repo.language, (histogram.get(repo.language) ?? 0) + 1);
+        }
+        starSum += repo.stargazers_count ?? 0;
+      }
+      languages = [...histogram.entries()]
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+      stars = starSum;
+    } catch {
+      // Repositories are a best-effort enrichment, never a sync blocker.
+    }
+
     return {
       solvedTotal: null,
       solvedEasy: null,
@@ -286,7 +369,13 @@ export const githubAdapter: PlatformAdapter = {
       contributions,
       streakCurrent: activity?.currentStreak ?? null,
       streakLongest: activity?.longestStreak ?? null,
-      raw: { login: user.login, public_repos: user.public_repos },
+      raw: {
+        login: user.login,
+        public_repos: user.public_repos,
+        following: user.following,
+        stars,
+        languages,
+      },
     };
   },
 

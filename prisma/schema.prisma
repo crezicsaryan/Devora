@@ -1,0 +1,467 @@
+// ============================================================================
+// Devora — Prisma schema (MySQL)
+//
+// Translated from the existing Postgres migrations:
+//   supabase/schema.sql, supabase/onboarding.sql, supabase/profile-v2.sql,
+//   supabase/activity.sql
+//
+// Every table and column the application already used is preserved. See
+// "POSTGRES -> MYSQL TRANSLATION NOTES" at the bottom for the deliberate
+// differences and why each one exists.
+//
+// The connection string is read from DATABASE_URL (see devora/.env). It is
+// server-side only — never expose it to the browser.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Username registry — case-insensitive global uniqueness.
+// The primary key IS the normalized handle, so two users racing for "Aryan"
+// and "aryan" cannot both win.
+// ---------------------------------------------------------------------------
+model UsernameRegistry {
+  username_normalized String   @id @db.VarChar(80)
+  username            String   @db.VarChar(80)
+  user_id             String   @db.Char(36)
+  created_at          DateTime @default(now()) @db.DateTime(3)
+
+  @@index([user_id], map: "username_registry_user_idx")
+  @@map("username_registry")
+}
+
+// ---------------------------------------------------------------------------
+// Profiles — identity, visibility and server-owned onboarding state.
+// ---------------------------------------------------------------------------
+model Profile {
+  user_id             String  @id @db.Char(36)
+  display_name        String  @default("") @db.VarChar(120)
+  display_username    String? @db.VarChar(80)
+  // Unique so a handle cannot be claimed by two rows. MySQL UNIQUE permits
+  // many NULLs, which is the equivalent of Postgres' partial index.
+  username_normalized String? @unique(map: "profiles_username_normalized_key") @db.VarChar(80)
+  bio                 String  @default("") @db.VarChar(2000)
+  developer_role      String  @default("") @db.VarChar(120)
+  college             String  @default("") @db.VarChar(200)
+  location            String? @db.VarChar(160)
+  avatar_url          String? @db.VarChar(512)
+  email               String? @db.VarChar(320)
+  website             String? @db.VarChar(512)
+  twitter_url         String? @db.VarChar(512)
+  linkedin_url        String? @db.VarChar(512)
+  portfolio_url       String? @db.VarChar(512)
+
+  // { "avatar": true, "email": false, ... }
+  //
+  // Nullable, not `NOT NULL DEFAULT ...`: MySQL forbids a literal DEFAULT on a
+  // JSON column AND Prisma's MySQL generator drops Json defaults entirely, so
+  // a NOT NULL Json column here would reject the app's inserts. Every read
+  // path already tolerates a missing value (`DEFAULT_VISIBILITY` in
+  // src/lib/types.ts, and `coalesce(...)` in SQL).
+  visibility Json?
+
+  onboarding_completed    Boolean   @default(false)
+  onboarding_step         Int       @default(1) @db.SmallInt
+  onboarding_completed_at DateTime? @db.DateTime(3)
+  profile_completion      Int       @default(0) @db.SmallInt
+
+  // Cached aggregates, recomputed from real rows — never written by a client.
+  total_solved         Int       @default(0)
+  current_streak       Int       @default(0)
+  longest_streak       Int       @default(0)
+  github_contributions Int       @default(0)
+  aggregates_updated_at DateTime? @db.DateTime(3)
+
+  created_at DateTime @default(now()) @db.DateTime(3)
+  updated_at DateTime @default(now()) @db.DateTime(3)
+
+  @@index([onboarding_completed], map: "profiles_onboarding_idx")
+  @@index([username_normalized, onboarding_completed], map: "profiles_username_lookup_idx")
+  @@map("profiles")
+}
+
+// ---------------------------------------------------------------------------
+// Skills catalogue + the user <-> skill join.
+// ---------------------------------------------------------------------------
+model Skill {
+  id         String   @id @default(uuid()) @db.Char(36)
+  slug       String   @unique(map: "skills_slug_key") @db.VarChar(80)
+  name       String   @db.VarChar(120)
+  category   String   @db.VarChar(40)
+  created_at DateTime @default(now()) @db.DateTime(3)
+
+  user_skills UserSkill[]
+
+  @@index([category], map: "skills_category_idx")
+  @@map("skills")
+}
+
+model UserSkill {
+  user_id     String   @db.Char(36)
+  skill_id    String   @db.Char(36)
+  position    Int      @default(0) @db.SmallInt
+  custom_name String?  @db.VarChar(120)
+  created_at  DateTime @default(now()) @db.DateTime(3)
+
+  skill Skill @relation(fields: [skill_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([user_id, skill_id])
+  @@index([user_id], map: "user_skills_user_idx")
+  @@map("user_skills")
+}
+
+// ---------------------------------------------------------------------------
+// Connected coding platforms.
+// ---------------------------------------------------------------------------
+model PlatformAccount {
+  id                String  @id @default(uuid()) @db.Char(36)
+  user_id           String  @db.Char(36)
+  platform          String  @db.VarChar(40)
+  username          String  @db.VarChar(120)
+  external_user_id  String? @db.VarChar(160)
+  profile_url       String? @db.VarChar(512)
+  avatar_url        String? @db.VarChar(512)
+  auth_type         String  @default("public") @db.VarChar(20)
+  connection_status String  @default("connected") @db.VarChar(20)
+  is_public         Boolean @default(false)
+  sync_status       String  @default("idle") @db.VarChar(16)
+  sync_error        String? @db.Text
+  last_synced_at    DateTime? @db.DateTime(3)
+  connected_at      DateTime @default(now()) @db.DateTime(3)
+  updated_at        DateTime @default(now()) @db.DateTime(3)
+
+  oauth_tokens PlatformOauthToken[]
+  coding_stats CodingStat[]
+
+  @@unique([user_id, platform], map: "platform_accounts_user_platform_key")
+  @@index([user_id], map: "platform_accounts_user_idx")
+  @@index([platform], map: "platform_accounts_platform_idx")
+  @@map("platform_accounts")
+}
+
+// ---------------------------------------------------------------------------
+// OAuth tokens. Server-only: no user-facing read path exists for this table.
+// ---------------------------------------------------------------------------
+model PlatformOauthToken {
+  id                  String   @id @default(uuid()) @db.Char(36)
+  platform_account_id String   @unique(map: "platform_oauth_tokens_account_key") @db.Char(36)
+  user_id             String   @db.Char(36)
+  platform            String   @db.VarChar(40)
+  access_token        String   @db.Text
+  refresh_token       String?  @db.Text
+  scope               String?  @db.VarChar(255)
+  token_type          String?  @db.VarChar(40)
+  expires_at          DateTime? @db.DateTime(3)
+  created_at          DateTime @default(now()) @db.DateTime(3)
+  updated_at          DateTime @default(now()) @db.DateTime(3)
+
+  account PlatformAccount @relation(fields: [platform_account_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("platform_oauth_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// One-time CSRF state for the GitHub OAuth handshake. Server-only.
+// ---------------------------------------------------------------------------
+model OauthState {
+  state      String   @id @db.VarChar(128)
+  user_id    String   @db.Char(36)
+  provider   String   @db.VarChar(40)
+  next       String?  @db.VarChar(512)
+  created_at DateTime @default(now()) @db.DateTime(3)
+  expires_at DateTime @db.DateTime(3)
+
+  @@map("oauth_states")
+}
+
+// ---------------------------------------------------------------------------
+// Per-platform snapshot + the authoritative daily series.
+// ---------------------------------------------------------------------------
+model CodingStat {
+  id                  String  @id @default(uuid()) @db.Char(36)
+  user_id             String  @db.Char(36)
+  platform_account_id String? @db.Char(36)
+  platform            String  @db.VarChar(40)
+
+  solved_total   Int?
+  solved_easy    Int?
+  solved_medium  Int?
+  solved_hard    Int?
+  rating         Int?
+  max_rating     Int?
+  rank_label     String? @db.VarChar(60)
+  contests       Int?
+  badges         Int?
+  reputation     Int?
+  followers      Int?
+  following      Int?
+  public_repos   Int?
+  contributions  Int?
+  streak_current Int?
+  streak_longest Int?
+
+  // Untouched adapter payload, for auditing.
+  raw        Json?
+  fetched_at DateTime @default(now()) @db.DateTime(3)
+
+  account PlatformAccount? @relation(fields: [platform_account_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([user_id, platform], map: "coding_stats_user_platform_key")
+  @@index([user_id], map: "coding_stats_user_idx")
+  @@map("coding_stats")
+}
+
+model ActivityDaily {
+  user_id    String   @db.Char(36)
+  platform   String   @db.VarChar(40)
+  day        DateTime @db.Date
+  count      Int      @default(0)
+  // {"easy":2,"medium":1,"hard":0}
+  difficulty Json?
+
+  @@id([user_id, platform, day])
+  @@index([user_id, day(sort: Desc)], map: "activity_daily_user_day_idx")
+  @@index([user_id, platform, day(sort: Desc)], map: "activity_daily_user_platform_day_idx")
+  @@map("activity_daily")
+}
+
+model TopicProgress {
+  user_id    String   @db.Char(36)
+  topic      String   @db.VarChar(120)
+  solved     Int      @default(0)
+  total      Int      @default(0)
+  source     String   @default("tracker") @db.VarChar(20)
+  updated_at DateTime @default(now()) @db.DateTime(3)
+
+  @@id([user_id, topic])
+  @@map("topic_progress")
+}
+
+// ---------------------------------------------------------------------------
+// Question tracker.
+// ---------------------------------------------------------------------------
+model Question {
+  id         String   @id @default(uuid()) @db.Char(36)
+  slug       String   @unique(map: "questions_slug_key") @db.VarChar(180)
+  title      String   @db.VarChar(300)
+  difficulty String   @db.VarChar(12)
+  topic      String?  @db.VarChar(120)
+  url        String?  @db.VarChar(512)
+  created_at DateTime @default(now()) @db.DateTime(3)
+
+  user_questions UserQuestion[]
+
+  @@map("questions")
+}
+
+model UserQuestion {
+  user_id     String    @db.Char(36)
+  question_id String    @db.Char(36)
+  status      String    @default("todo") @db.VarChar(12)
+  note        String?   @db.Text
+  solved_at   DateTime? @db.DateTime(3)
+  updated_at  DateTime  @default(now()) @db.DateTime(3)
+
+  question Question @relation(fields: [question_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([user_id, question_id])
+  @@index([user_id], map: "user_questions_user_idx")
+  @@map("user_questions")
+}
+
+// ---------------------------------------------------------------------------
+// Projects.
+// ---------------------------------------------------------------------------
+model Project {
+  id          String  @id @default(uuid()) @db.Char(36)
+  user_id     String  @db.Char(36)
+  name        String  @db.VarChar(160)
+  description String  @default("") @db.VarChar(2000)
+  // Postgres text[] -> JSON array of strings. Nullable for the same reason as
+  // Profile.visibility (Prisma cannot provision a Json default on MySQL).
+  tech_stack  Json?
+  image_url   String? @db.VarChar(512)
+  github_url  String? @db.VarChar(512)
+  live_url    String? @db.VarChar(512)
+  is_featured Boolean @default(false)
+  source      String  @default("manual") @db.VarChar(12)
+  external_id String? @db.VarChar(160)
+  created_at  DateTime @default(now()) @db.DateTime(3)
+  updated_at  DateTime @default(now()) @db.DateTime(3)
+
+  // MySQL UNIQUE allows repeated NULLs, matching the Postgres partial index
+  // (rows without an external_id are not deduplicated).
+  @@unique([user_id, source, external_id], map: "projects_user_external_key")
+  @@index([user_id], map: "projects_user_idx")
+  @@map("projects")
+}
+
+// ---------------------------------------------------------------------------
+// Achievements — awarded server-side from real data only.
+// ---------------------------------------------------------------------------
+model Achievement {
+  id          String   @id @default(uuid()) @db.Char(36)
+  code        String   @unique(map: "achievements_code_key") @db.VarChar(60)
+  title       String   @db.VarChar(160)
+  description String   @default("") @db.VarChar(500)
+  tier        String   @default("bronze") @db.VarChar(20)
+  metric      String   @db.VarChar(30)
+  threshold   Int
+  icon        String   @default("🏆") @db.VarChar(16)
+  created_at  DateTime @default(now()) @db.DateTime(3)
+
+  user_achievements UserAchievement[]
+
+  @@map("achievements")
+}
+
+model UserAchievement {
+  user_id        String   @db.Char(36)
+  achievement_id String   @db.Char(36)
+  unlocked_at    DateTime @default(now()) @db.DateTime(3)
+
+  achievement Achievement @relation(fields: [achievement_id], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([user_id, achievement_id])
+  @@index([user_id], map: "user_achievements_user_idx")
+  @@map("user_achievements")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications.
+// ---------------------------------------------------------------------------
+model Notification {
+  id         String    @id @default(uuid()) @db.Char(36)
+  user_id    String    @db.Char(36)
+  kind       String    @default("system") @db.VarChar(30)
+  title      String    @db.VarChar(200)
+  body       String    @default("") @db.VarChar(1000)
+  href       String?   @db.VarChar(512)
+  read_at    DateTime? @db.DateTime(3)
+  created_at DateTime  @default(now()) @db.DateTime(3)
+
+  @@index([user_id, created_at(sort: Desc)], map: "notifications_user_idx")
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Sync jobs + logs.
+// ---------------------------------------------------------------------------
+model SyncJob {
+  id          String    @id @default(uuid()) @db.Char(36)
+  user_id     String    @db.Char(36)
+  platform    String    @db.VarChar(40)
+  status      String    @default("queued") @db.VarChar(16)
+  attempt     Int       @default(0) @db.SmallInt
+  error       String?   @db.Text
+  queued_at   DateTime  @default(now()) @db.DateTime(3)
+  started_at  DateTime? @db.DateTime(3)
+  finished_at DateTime? @db.DateTime(3)
+
+  @@index([user_id, queued_at(sort: Desc)], map: "sync_jobs_user_idx")
+  @@index([status, queued_at], map: "sync_jobs_pending_idx")
+  @@map("sync_jobs")
+}
+
+model SyncLog {
+  id          String   @id @default(uuid()) @db.Char(36)
+  user_id     String   @db.Char(36)
+  platform    String   @db.VarChar(40)
+  status      String   @db.VarChar(16)
+  message     String?  @db.Text
+  duration_ms Int?
+  created_at  DateTime @default(now()) @db.DateTime(3)
+
+  @@index([user_id, created_at(sort: Desc)], map: "sync_logs_user_idx")
+  @@map("sync_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Activity feed — drives "Recent Activity" and the dashboard charts.
+// The lower-case columns after `occurred_at` come from supabase/activity.sql.
+// ---------------------------------------------------------------------------
+model ActivityEvent {
+  id          String   @id @default(uuid()) @db.Char(36)
+  user_id     String   @db.Char(36)
+  kind        String   @db.VarChar(40)
+  title       String   @db.VarChar(200)
+  detail      String?  @db.Text
+  href        String?  @db.VarChar(512)
+  metadata    Json?
+  occurred_at DateTime @default(now()) @db.DateTime(3)
+
+  platform      String?   @db.VarChar(40)
+  activity_type String?   @db.VarChar(40)
+  external_id   String?   @db.VarChar(160)
+  difficulty    String?   @db.VarChar(12)
+  topic         String?   @db.VarChar(120)
+  activity_date DateTime? @db.Date
+
+  @@unique([user_id, platform, activity_type, external_id], map: "activity_events_external_key")
+  @@index([user_id, occurred_at(sort: Desc)], map: "activity_events_user_idx")
+  @@index([user_id, activity_date(sort: Desc)], map: "activity_events_user_day_idx")
+  @@index([user_id, activity_type, activity_date(sort: Desc)], map: "activity_events_user_type_idx")
+  @@map("activity_events")
+}
+
+// ============================================================================
+// POSTGRES -> MYSQL TRANSLATION NOTES
+//
+// 1. `auth.users` foreign keys are GONE.
+//    Postgres had `user_id uuid references auth.users(id) on delete cascade`.
+//    `auth.users` is a Supabase-Postgres-only table and authentication is still
+//    handled by Supabase, so no such table exists in MySQL. `user_id` is now a
+//    plain CHAR(36) holding the Supabase user UUID. CONSEQUENCE: deleting a
+//    user in Supabase no longer cascades here — the application must clean up
+//    its own rows on account deletion.
+//
+// 2. uuid -> CHAR(36).
+//    MySQL has no uuid column type. Ids are stored as their canonical
+//    36-character string form. `@default(uuid())` gives MySQL 8 an
+//    expression default, so inserts that omit the id still get one.
+//
+// 3. jsonb -> JSON, and JSON columns became NULLABLE.
+//    Same operators (`->`, `->>`) exist in MySQL 5.7+, so read paths keep
+//    working. Note MySQL returns JSON as a parsed object where Postgres `pg`
+//    returned a string — see the data-layer port notes.
+//    A JSON default (the old `default '{}'::jsonb`) cannot be provisioned:
+//    MySQL rejects a literal DEFAULT on a JSON column, and Prisma's MySQL
+//    generator drops Json defaults even when written as `dbgenerated(...)`.
+//    The four affected columns (profiles.visibility, activity_daily.difficulty,
+//    projects.tech_stack, activity_events.metadata) are therefore nullable and
+//    the application supplies the value. Every existing read path already
+//    falls back — DEFAULT_VISIBILITY, `?? []`, `coalesce(...)` in SQL — so no
+//    behaviour is lost.
+//
+// 4. text[] (projects.tech_stack) -> JSON array.
+//
+// 5. Filtered ("partial") indexes do NOT exist in MySQL. They became plain
+//    indexes. For the three partial UNIQUE indexes this is equivalent, because
+//    MySQL treats NULLs as distinct, so rows with a NULL key are never
+//    deduplicated — exactly what `where ... is not null` achieved.
+//
+// 6. `text ... default ''` -> VARCHAR with a generous length.
+//    MySQL rejects a literal DEFAULT on TEXT/JSON columns, so defaulted
+//    strings became VARCHAR. Lengths are set well above the application's own
+//    validation caps.
+//
+// 7. `updated_at` triggers are NOT created by Prisma. They are applied
+//    separately (prisma/sql/devora_triggers.sql) so raw-SQL write paths keep
+//    the same touch-on-update behaviour Postgres had.
+//
+// 8. Row Level Security is impossible in MySQL, and is not needed: every read
+//    and write already goes through a server-side route handler that resolves
+//    the user from the Supabase session. The Postgres-only
+//    `devora_public_profile()` SQL function must be reimplemented in
+//    TypeScript.
+//
+// 9. `public.devora_profiles` (the legacy JSONB profile from schema.sql) is
+//    deliberately NOT translated — nothing in src/ references it any more.
+// ============================================================================

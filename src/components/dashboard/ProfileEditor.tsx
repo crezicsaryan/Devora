@@ -38,7 +38,8 @@ export function ProfileEditor() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);  const [displayName, setDisplayName] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [displayName, setDisplayName] = useState("");
   const [username, setUsername] = useState("");
   const [originalUsername, setOriginalUsername] = useState("");
   const [college, setCollege] = useState("");
@@ -46,7 +47,6 @@ export function ProfileEditor() {
   const [developerRole, setDeveloperRole] = useState("");
   const [location, setLocation] = useState("");
   const [avatarUrl, setAvatarUrl] = useState("");
-  const [email, setEmail] = useState("");
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [usernameState, setUsernameState] = useState<UsernameState>({ kind: "idle" });
   const [completion, setCompletion] = useState(0);
@@ -72,7 +72,6 @@ export function ProfileEditor() {
         setDeveloperRole(p.developerRole ?? "");
         setLocation(p.location ?? "");
         setAvatarUrl(p.avatarUrl ?? "");
-        setEmail(p.email ?? "");
         setCompletion(res.data.completion?.percent ?? 0);
       } else if (res.status === 401) {
         router.replace("/login?next=/dashboard/profile");
@@ -533,15 +532,6 @@ export function ProfileEditor() {
               placeholder="Backend engineer who enjoys graph problems and shipping side projects."
             />
             <span className={styles.hint}>{bio.length}/320</span>
-          </div>
-
-          <div className={`${styles.field} ${styles.fieldFull}`}>
-            <span className={styles.label}>Email</span>
-            <input className={styles.input} value={email} readOnly disabled />
-            <span className={styles.hint}>
-              Your email is managed by your account and is never shown publicly unless you enable
-              it in Settings.
-            </span>
           </div>
         </div>
 

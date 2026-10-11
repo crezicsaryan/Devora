@@ -9,7 +9,7 @@
 import "server-only";
 import { redirect } from "next/navigation";
 import { getProfile } from "@/lib/db/repository";
-import { hasDatabase } from "@/lib/db/pool";
+import { hasDatabase } from "@/lib/db/prisma";
 import { getSessionUser } from "@/lib/server-auth";
 
 export type ShellUser = {

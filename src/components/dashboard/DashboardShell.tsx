@@ -58,6 +58,9 @@ export function DashboardShell({
   const [signingOut, setSigningOut] = useState(false);
 
   const menuRef = useRef<HTMLDivElement>(null);
+  const railRef = useRef<HTMLElement>(null);
+  const railToggleRef = useRef<HTMLButtonElement>(null);
+  const railCloseRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let alive = true;
@@ -71,16 +74,45 @@ export function DashboardShell({
     };
   }, [pathname]);
 
+  // Outside click closes the popovers, Escape closes the popovers AND the
+  // navigation drawer. Listeners live on the document so they also fire for
+  // clicks that land outside the drawer (which is fixed and full-height).
   useEffect(() => {
-    function onClick(event: MouseEvent) {
+    function onPointerDown(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         setMenuOpen(false);
         setBellOpen(false);
       }
     }
-    document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
-  }, []);
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      setBellOpen(false);
+      if (menuOpen) {
+        setMenuOpen(false);
+        return;
+      }
+      setRailOpen(false);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
+
+  // Move focus into the drawer when it opens, and hand it back to the
+  // hamburger when it closes — keyboard users are never stranded off-canvas.
+  const railWasOpen = useRef(false);
+  useEffect(() => {
+    if (railOpen) {
+      railWasOpen.current = true;
+      railCloseRef.current?.focus();
+    } else if (railWasOpen.current) {
+      railWasOpen.current = false;
+      railToggleRef.current?.focus();
+    }
+  }, [railOpen]);
 
   // Close the tablet rail whenever the route changes. Adjusting state during
   // render is React's documented alternative to a setState-in-effect.
@@ -137,11 +169,24 @@ export function DashboardShell({
 
   return (
     <div className={styles.shell}>
-      {/* backdrop for the tablet rail */}
-      <div className={styles.backdrop} data-hidden={!railOpen} onClick={() => setRailOpen(false)} />
+      {/* Scrim: clicking outside the drawer closes it. Inert (pointer-events:
+          none) while the drawer is closed, so it blocks nothing. */}
+      <div
+        className={styles.backdrop}
+        data-hidden={!railOpen}
+        onClick={() => setRailOpen(false)}
+        aria-hidden="true"
+      />
 
-      {/* ---------------- sidebar ---------------- */}
-      <aside className={styles.sidebar} data-open={railOpen}>
+      {/* ---------------- navigation drawer ---------------- */}
+      <aside
+        id="devora-sidebar"
+        ref={railRef}
+        className={styles.sidebar}
+        data-open={railOpen}
+        aria-label="Navigation drawer"
+        aria-hidden={!railOpen}
+      >
         <div className={styles.sidebarBrand}>
           <Image
             src="/logo/devora-lockup-white.png"
@@ -152,6 +197,7 @@ export function DashboardShell({
           />
           <button
             type="button"
+            ref={railCloseRef}
             className={styles.railClose}
             onClick={() => setRailOpen(false)}
             aria-label="Close navigation"
@@ -200,9 +246,12 @@ export function DashboardShell({
         <header className={styles.header}>
           <button
             type="button"
+            ref={railToggleRef}
             className={styles.railToggle}
-            onClick={() => setRailOpen(true)}
-            aria-label="Open navigation"
+            onClick={() => setRailOpen((open) => !open)}
+            aria-label={railOpen ? "Close navigation" : "Open navigation"}
+            aria-expanded={railOpen}
+            aria-controls="devora-sidebar"
           >
             <span /><span /><span />
           </button>
@@ -224,7 +273,7 @@ export function DashboardShell({
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search questions, handles, sheets…"
+              placeholder="Search questions or handles…"
               aria-label="Search"
             />
           </form>

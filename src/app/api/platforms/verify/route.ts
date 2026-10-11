@@ -1,15 +1,22 @@
 /**
- * GET /api/platforms/verify?platform=leetcode&u=handle
+ * GET /api/platforms/verify?platform=leetcode&u=handle-or-url
  *
- * Cheap existence check for the onboarding UI, so the user gets feedback
- * before they press Connect. Delegates to the same adapter that will perform
- * the real sync — one code path, not two.
+ * Cheap, classified existence check for the platforms UI, so the user gets an
+ * answer before they press Connect. Delegates to the same adapter that will
+ * perform the real sync — one code path, not two.
+ *
+ * The response is a `PlatformVerifyResult`, never a bare boolean: the caller
+ * needs to know whether the account is missing, or whether we simply could not
+ * check. Returning `exists: false` for a timeout is what made every platform
+ * look like it was rejecting valid usernames.
  */
 
 import type { NextRequest } from "next/server";
 import { errorResponse, okResponse, requireProfileUser } from "@/lib/server-auth";
 import { getAdapter } from "@/lib/platforms/registry";
-import { PlatformError } from "@/lib/platforms/types";
+import { resolvePlatformInput } from "@/lib/profile-links";
+import type { PlatformVerifyResult } from "@/lib/types";
+import { PLATFORM_BY_KEY } from "@/lib/types";
 import { PLATFORM_KEYS, type PlatformKey } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -19,30 +26,48 @@ export async function GET(request: NextRequest) {
     await requireProfileUser();
 
     const platform = request.nextUrl.searchParams.get("platform") as PlatformKey | null;
-    const username = request.nextUrl.searchParams.get("u") ?? "";
+    const raw =
+      request.nextUrl.searchParams.get("u") ??
+      request.nextUrl.searchParams.get("input") ??
+      "";
 
     if (!platform || !PLATFORM_KEYS.includes(platform)) {
       return errorResponse(new Error("Unknown platform."), "Unknown platform.");
     }
-    if (username.trim().length < 1) {
-      return okResponse({ exists: false, message: "Enter your username." });
+
+    const meta = PLATFORM_BY_KEY[platform];
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return errorResponse(
+        new Error("Enter your username or your profile URL."),
+        "Enter your username or your profile URL."
+      );
+    }
+
+    const resolved = resolvePlatformInput(platform, trimmed);
+    if (resolved.error || !resolved.username) {
+      return errorResponse(
+        new Error(resolved.error ?? "That profile link is not valid."),
+        resolved.error ?? "That profile link is not valid."
+      );
     }
 
     const adapter = getAdapter(platform);
-    if (adapter.authType === "oauth") {
-      return okResponse({
-        exists: false,
-        message: "This platform connects through authorization.",
-        requiresOAuth: true,
-      });
-    }
+    const verdict = await adapter.verify(resolved.username);
 
-    const verdict = await adapter.verify(username.trim());
-    return okResponse(verdict);
+    // Spread into a NEW object rather than mutating the verdict: an adapter is
+    // free to return a cached value, and writing the caller's handle into it
+    // would make the next request see this one's data.
+    const result: PlatformVerifyResult = {
+      ...verdict,
+      // Prefer the handle/URL the platform itself reported; otherwise fall back
+      // to what we resolved from the user's input.
+      username: verdict.username ?? resolved.username,
+      profileUrl: verdict.profileUrl ?? resolved.url,
+    };
+
+    return okResponse({ ...result, linkOnly: meta.linkOnly });
   } catch (error) {
-    if (error instanceof PlatformError) {
-      return okResponse({ exists: false, message: error.message });
-    }
-    return errorResponse(error, "Could not verify that username.");
+    return errorResponse(error, "Could not verify that profile.");
   }
 }

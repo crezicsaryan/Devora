@@ -16,7 +16,7 @@ import {
   recordActivityEvent,
   updateProfile,
 } from "@/lib/db/repository";
-import { query } from "@/lib/db/pool";
+import { prisma } from "@/lib/db/prisma";
 import { errorResponse, okResponse, requireProfileUser } from "@/lib/server-auth";
 import { firstIssue, projectSchema, validateUrl } from "@/lib/validation";
 
@@ -54,21 +54,19 @@ export async function POST(request: NextRequest) {
     const image = validateUrl(data.imageUrl, { label: "Project image" });
     if (image.error) return errorResponse(new Error(image.error), image.error);
 
-    const inserted = await query<{ id: string }>(
-      `insert into public.projects
-         (user_id, name, description, tech_stack, github_url, live_url, image_url, source)
-       values ($1,$2,$3,$4,$5,$6,$7,'manual')
-       returning id`,
-      [
-        user.id,
-        data.name,
-        data.description ?? "",
-        data.techStack ?? [],
-        github.url,
-        live.url,
-        image.url,
-      ]
-    );
+    const inserted = await prisma.project.create({
+      data: {
+        user_id: user.id,
+        name: data.name,
+        description: data.description ?? "",
+        tech_stack: data.techStack ?? [],
+        github_url: github.url,
+        live_url: live.url,
+        image_url: image.url,
+        source: "manual",
+      },
+      select: { id: true },
+    });
 
     await recordActivityEvent({
       userId: user.id,
@@ -82,7 +80,7 @@ export async function POST(request: NextRequest) {
     await evaluateAchievements(user.id).catch(() => undefined);
     const completion = await computeProfileCompletion(user.id);
 
-    return okResponse({ ok: true, id: inserted[0].id, completion });
+    return okResponse({ ok: true, id: inserted.id, completion });
   } catch (error) {
     return errorResponse(error, "Could not save that project.");
   }
